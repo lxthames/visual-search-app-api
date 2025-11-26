@@ -36,8 +36,8 @@ Common Python dependencies (see `requirements.txt` in the repo for the full list
 1. Clone the repository
 
    ```bash
-   git clone <YOUR_REPO_URL>.git
-   cd <YOUR_PROJECT_FOLDER>
+   git clone repo.git
+   cd project folder
    ````
 
 2. **Create and activate a virtual environment** (recommended)
