@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Visual Search Demo</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+      max-width: 900px;
+    }
+    h1, h2 {
+      margin-bottom: 0.5rem;
+    }
+    section {
+      border: 1px solid #ccc;
+      padding: 15px;
+      margin-bottom: 20px;
+      border-radius: 6px;
+    }
+    label {
+      display: block;
+      margin-top: 8px;
+    }
+    input[type="text"],
+    input[type="number"] {
+      width: 200px;
+    }
+    button {
+      margin-top: 10px;
+      padding: 6px 12px;
+      cursor: pointer;
+    }
+    #result-image {
+      max-width: 100%;
+      margin-top: 10px;
+      border: 1px solid #ddd;
+    }
+    #shelves-list {
+      margin-top: 8px;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+    }
+    .small {
+      font-size: 0.8rem;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+  <h1>Visual Shelf Search</h1>
+
+  <section>
+    <h2>1. Index Shelf</h2>
+    <p>Upload a shelf image and detect objects.</p>
+    <label>Shelf image:
+      <input type="file" id="shelf-file" accept="image/*" />
+    </label>
+    <label>Prompt:
+      <input type="text" id="prompt" value="Bottle" />
+    </label>
+    <label>Box threshold (0 - 1):
+      <input type="number" id="box-thresh" step="0.05" value="0.3" />
+    </label>
+    <button id="index-shelf-btn">Index Shelf</button>
+    <div id="index-result" class="small"></div>
+  </section>
+
+  <section>
+    <h2>2. Shelves</h2>
+    <button id="refresh-shelves-btn">Refresh Shelves List</button>
+    <div id="shelves-list"></div>
+  </section>
+
+  <section>
+    <h2>3. Search</h2>
+    <p>Upload a query image and search on a specific shelf.</p>
+    <label>Query image:
+      <input type="file" id="query-file" accept="image/*" />
+    </label>
+    <label>Shelf ID:
+      <input type="text" id="shelf-id-input" placeholder="Use last indexed if blank" />
+    </label>
+    <label>Max results:
+      <input type="number" id="max-results" value="10" />
+    </label>
+    <label>Match threshold (distance, smaller = more similar):
+      <input type="number" id="match-threshold" step="0.01" value="0.19" />
+    </label>
+    <div>
+      <button id="search-json-btn">Search (JSON)</button>
+      <button id="search-visual-btn">Search (Visual)</button>
+    </div>
+    <pre id="search-json-result"></pre>
+    <img id="result-image" alt="Visual search result" />
+  </section>
+
+  <script>
+    let lastShelfId = null;
+
+    async function indexShelf() {
+      const fileInput = document.getElementById("shelf-file");
+      const promptInput = document.getElementById("prompt");
+      const boxInput = document.getElementById("box-thresh");
+      const resultDiv = document.getElementById("index-result");
+
+      if (!fileInput.files.length) {
+        alert("Please choose a shelf image.");
+        return;
+      }
+
+      const file = fileInput.files[0];
+      const prompt = promptInput.value || "Bottle";
+      const boxThresh = parseFloat(boxInput.value || "0.3");
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const url = `/api/index-shelf?prompt=${encodeURIComponent(prompt)}&box_thresh=${encodeURIComponent(boxThresh)}`;
+
+      resultDiv.textContent = "Indexing shelf...";
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          body: formData,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `Error: ${res.status}`);
+        }
+        const data = await res.json();
+        lastShelfId = data.image_id;
+        resultDiv.textContent = `Indexed shelf.\nShelf ID: ${data.image_id}\nDetections: ${data.num_detections}\nIndexed objects: ${data.num_indexed}`;
+      } catch (err) {
+        console.error(err);
+        resultDiv.textContent = `Failed to index shelf: ${err.message}`;
+      }
+    }
+
+    async function refreshShelves() {
+      const listDiv = document.getElementById("shelves-list");
+      listDiv.textContent = "Loading shelves...";
+      try {
+        const res = await fetch("/api/shelves");
+        if (!res.ok) {
+          throw new Error(`Error: ${res.status}`);
+        }
+        const data = await res.json();
+        if (!data.length) {
+          listDiv.textContent = "No shelves indexed yet.";
+          return;
+        }
+        const lines = data.map(s => `shelf_id=${s.shelf_id} | objects=${s.num_objects}`);
+        listDiv.textContent = lines.join("\n");
+      } catch (err) {
+        console.error(err);
+        listDiv.textContent = `Failed to load shelves: ${err.message}`;
+      }
+    }
+
+    function getShelfIdOrLast() {
+      const shelfInput = document.getElementById("shelf-id-input");
+      const val = shelfInput.value.trim();
+      if (val) return val;
+      return lastShelfId;
+    }
+
+    async function searchJson() {
+      const fileInput = document.getElementById("query-file");
+      const maxResultsInput = document.getElementById("max-results");
+      const thresholdInput = document.getElementById("match-threshold");
+      const resultPre = document.getElementById("search-json-result");
+      const img = document.getElementById("result-image");
+      img.src = ""; // clear previous image
+
+      if (!fileInput.files.length) {
+        alert("Please choose a query image.");
+        return;
+      }
+
+      const shelfId = getShelfIdOrLast();
+      if (!shelfId) {
+        alert("No shelf_id provided and no last shelf indexed.");
+        return;
+      }
+
+      const file = fileInput.files[0];
+      const maxResults = parseInt(maxResultsInput.value || "10", 10);
+      const matchThreshold = parseFloat(thresholdInput.value || "0.19");
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const url = `/api/search?shelf_id=${encodeURIComponent(shelfId)}&max_results=${encodeURIComponent(maxResults)}&match_threshold=${encodeURIComponent(matchThreshold)}`;
+
+      resultPre.textContent = "Searching...";
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          body: formData,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `Error: ${res.status}`);
+        }
+        const data = await res.json();
+        resultPre.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        console.error(err);
+        resultPre.textContent = `Failed to search: ${err.message}`;
+      }
+    }
+
+    async function searchVisual() {
+      const fileInput = document.getElementById("query-file");
+      const maxResultsInput = document.getElementById("max-results");
+      const thresholdInput = document.getElementById("match-threshold");
+      const resultPre = document.getElementById("search-json-result");
+      const img = document.getElementById("result-image");
+
+      if (!fileInput.files.length) {
+        alert("Please choose a query image.");
+        return;
+      }
+
+      const shelfId = getShelfIdOrLast();
+      if (!shelfId) {
+        alert("No shelf_id provided and no last shelf indexed.");
+        return;
+      }
+
+      const file = fileInput.files[0];
+      const maxResults = parseInt(maxResultsInput.value || "10", 10);
+      const matchThreshold = parseFloat(thresholdInput.value || "0.19");
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const url = `/api/search-visual?shelf_id=${encodeURIComponent(shelfId)}&max_results=${encodeURIComponent(maxResults)}&match_threshold=${encodeURIComponent(matchThreshold)}`;
+
+      resultPre.textContent = "Searching (visual)...";
+      img.src = "";
+
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          body: formData,
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(errText || `Error: ${res.status}`);
+        }
+        const blob = await res.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        img.src = objectUrl;
+        resultPre.textContent = `Visual result for shelf_id=${shelfId}`;
+      } catch (err) {
+        console.error(err);
+        resultPre.textContent = `Failed to search (visual): ${err.message}`;
+      }
+    }
+
+    document.getElementById("index-shelf-btn").addEventListener("click", indexShelf);
+    document.getElementById("refresh-shelves-btn").addEventListener("click", refreshShelves);
+    document.getElementById("search-json-btn").addEventListener("click", searchJson);
+    document.getElementById("search-visual-btn").addEventListener("click", searchVisual);
+
+    // Load shelves on startup
+    refreshShelves();
+  </script>
+</body>
+</html>
