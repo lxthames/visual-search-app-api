@@ -15,3 +15,5 @@ pymongo
 numpy
 python-dotenv
 python-multipart
+
+pymilvus
