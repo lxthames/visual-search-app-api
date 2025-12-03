@@ -1,6 +1,6 @@
 from __future__ import annotations 
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 from collections import defaultdict
 import io
 import uuid
@@ -53,6 +53,14 @@ class MatchResult(BaseModel):
 
 class SearchResponse(BaseModel):
     matches: List[MatchResult]
+
+class SingleQueryImageOut(BaseModel):
+    id: str
+    modelName: str
+    skuDescription: Optional[str] = None
+    skuId: Optional[str] = None
+    tenantId: Optional[str] = None
+    image_base64: str
 
 
 # ===========================
@@ -446,17 +454,12 @@ async def search_visual_multi(
 # ===========================
 # Single query image storage
 # ===========================
-@router.post("/single-query-image")
-async def single_query_image(
-    modelName: str = Form(...),
-    ClassificationItem: str = Form(...),
-    image: UploadFile = File(...),
-):
-    """Store a single query image + metadata into MongoDB as base64."""
+
+def get_single_query_images_collection():
+    """Get the MongoDB collection used to store single query images."""
     if not settings.MONGO_URI:
         raise HTTPException(status_code=500, detail="MongoDB URI is not configured")
 
-    # Connect to MongoDB
     try:
         mongo_client = pymongo.MongoClient(
             settings.MONGO_URI,
@@ -474,18 +477,48 @@ async def single_query_image(
                 mongo_db = mongo_client["cstore-ai"]
 
         collection = mongo_db["single_query_images"]
+        return collection
 
     except Exception:
         raise HTTPException(status_code=500, detail="Failed to connect to MongoDB")
 
+
+
+
+@router.post("/query-images/upload")
+async def upload_single_query_image(
+    modelName: str = Form(...),
+    skuDescription: str = Form(...),
+    skuId: str = Form(...),
+    tenantId: str = Form(...),
+    image: UploadFile = File(...),
+):
+    """Upload a single query image with SKU + tenant info and store in MongoDB (base64)."""
+    if not settings.MONGO_URI:
+        raise HTTPException(status_code=500, detail="MongoDB URI is not configured")
+
+    # 取得 collection（沿用你的 helper）
+    collection = get_single_query_images_collection()
+
+    # 基本檔案驗證（可依需求調整）
+    if image.content_type is None or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are allowed")
+
+    # 可選：限制檔案大小，例如 5MB
+    MAX_SIZE = 5 * 1024 * 1024
     file_bytes = await image.read()
+    if len(file_bytes) > MAX_SIZE:
+        raise HTTPException(status_code=413, detail="Image file too large")
+
     image_b64 = base64.b64encode(file_bytes).decode("utf-8")
 
     doc_id = str(uuid.uuid4())
     document = {
         "_id": doc_id,
         "modelName": modelName,
-        "ClassificationItem": ClassificationItem,
+        "skuDescription": skuDescription,
+        "skuId": skuId,
+        "tenantId": tenantId,
         "filename": image.filename,
         "content_type": image.content_type,
         "image_base64": image_b64,
@@ -509,3 +542,256 @@ async def single_query_image(
         "id": str(result.inserted_id),
         "status": "stored",
     }
+
+
+
+@router.get("/query-images", response_model=List[SingleQueryImageOut])
+async def list_query_images(
+    modelName: str,
+    skuId: str | None = None,
+    tenantId: str | None = None,
+    skuDescription: str | None = None,
+):
+    """
+    Return stored query images filtered by:
+    - required: modelName
+    - optional: skuId, tenantId, skuDescription
+    """
+    collection = get_single_query_images_collection()
+
+    # Build MongoDB query dynamically
+    query: Dict[str, str] = {"modelName": modelName}
+    if skuId is not None:
+        query["skuId"] = skuId
+    if tenantId is not None:
+        query["tenantId"] = tenantId
+    if skuDescription is not None:
+        query["skuDescription"] = skuDescription
+
+    try:
+        docs = list(collection.find(query))
+    except OperationFailure as e:
+        try:
+            errmsg = e.details.get("errmsg", "")
+        except Exception:
+            errmsg = str(e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"MongoDB read error: {errmsg}",
+        )
+
+    results: List[SingleQueryImageOut] = []
+
+    for doc in docs:
+        _id = str(doc.get("_id"))
+        model_name = doc.get("modelName", "")
+        sku_description = doc.get("skuDescription")
+        sku_id = doc.get("skuId")
+        tenant_id = doc.get("tenantId")
+        image_b64 = doc.get("image_base64", "")
+
+        results.append(
+            SingleQueryImageOut(
+                id=_id,
+                modelName=model_name,
+                skuDescription=sku_description,
+                skuId=sku_id,
+                tenantId=tenant_id,
+                image_base64=image_b64,
+            )
+        )
+
+    return results
+
+
+
+
+ 
+
+#return models coreesponding images
+
+
+@router.get("/search-visual-model")
+async def search_visual_by_model(
+    modelName: str,
+    max_results: int = 10,
+    match_threshold: float = 0.19,
+    only_matches: bool = True,
+    as_zip: bool = False,
+):
+    """
+    Visual search across ALL shelves using all stored images for the given modelName.
+
+    Works similarly to /search-visual-multi, but:
+    - No image upload in the request.
+    - Loads all images from MongoDB where modelName matches.
+    """
+    # 1. Get all query images for this modelName from MongoDB
+    collection = get_single_query_images_collection()
+    try:
+        docs = list(collection.find({"modelName": modelName}))
+    except OperationFailure as e:
+        try:
+            errmsg = e.details.get("errmsg", "")
+        except Exception:
+            errmsg = str(e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"MongoDB read error: {errmsg}",
+        )
+
+    if not docs:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No stored images found for modelName='{modelName}'",
+        )
+
+    vectorizer = get_vectorizer()
+    datastore = get_datastore()
+
+    matches: List[MatchResult] = []
+
+    # 2. For each stored image, run visual search and accumulate matches
+    for doc in docs:
+        image_b64 = doc.get("image_base64")
+        if not image_b64:
+            continue
+        try:
+            image_bytes = base64.b64decode(image_b64)
+            query_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except Exception:
+            # Skip invalid or unreadable images
+            continue
+
+        query_vector = vectorizer.get_image_embedding(query_image)
+
+        # Ask for extra results (similar to /search-visual-multi)
+        results = datastore.query_similar(query_vector, n_results=max_results * 3)
+
+        for res in results:
+            data = res["data"]
+            parent_id = data.get("parent_image_id")
+            if parent_id is None:
+                continue
+
+            score = res["score"]
+            if only_matches and score > match_threshold:
+                continue
+
+            bbox = data.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+
+            matches.append(
+                MatchResult(
+                    shelf_id=parent_id,
+                    bbox=bbox,
+                    score=score,
+                )
+            )
+
+            # Stop when we collected enough global matches
+            if len(matches) >= max_results:
+                break
+
+        if len(matches) >= max_results:
+            break
+
+    if not matches:
+        raise HTTPException(
+            status_code=404,
+            detail="No sufficiently good matches found for this modelName",
+        )
+
+    # 3. Same drawing/response logic as in /search-visual-multi
+
+    # Group matches by shelf_id
+    shelf_to_matches: Dict[str, List[MatchResult]] = defaultdict(list)
+    for m in matches:
+        shelf_to_matches[m.shelf_id].append(m)
+
+    # Sort each shelf's matches by score ascending
+    for sid in shelf_to_matches:
+        shelf_to_matches[sid].sort(key=lambda m: m.score)
+
+    # Load each shelf image from disk and draw boxes
+    shelves_dir = settings.SHELF_DIR
+    annotated_images: Dict[str, np.ndarray] = {}
+
+    for shelf_id, shelf_matches in shelf_to_matches.items():
+        shelf_path = shelves_dir / f"{shelf_id}.png"
+        if not shelf_path.exists():
+            continue
+
+        shelf_img = cv2.imread(str(shelf_path))
+        if shelf_img is None:
+            continue
+
+        for m in shelf_matches:
+            x1, y1, x2, y2 = m.bbox
+
+            cv2.rectangle(
+                shelf_img,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),  # green
+                2,
+            )
+
+            cv2.putText(
+                shelf_img,
+                f"{m.score:.2f}",
+                (x1, max(y1 - 10, 0)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+        annotated_images[shelf_id] = shelf_img
+
+    if not annotated_images:
+        raise HTTPException(status_code=404, detail="No shelf images found on disk")
+
+    # 4. Mode A: Return ZIP of per-shelf images
+    if as_zip:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for shelf_id, img in annotated_images.items():
+                success, buffer = cv2.imencode(".png", img)
+                if not success:
+                    continue
+
+                png_bytes = buffer.tobytes()
+                filename = f"{shelf_id}.png"
+                zipf.writestr(filename, png_bytes)
+
+        zip_buffer.seek(0)
+        headers = {
+            "Content-Disposition": 'attachment; filename="search_results_model.zip"',
+        }
+        return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+
+    # 5. Mode B: One combined PNG (stacked vertically)
+    imgs = list(annotated_images.values())
+
+    widths = [img.shape[1] for img in imgs]
+    heights = [img.shape[0] for img in imgs]
+    max_width = max(widths)
+    total_height = sum(heights) + 10 * (len(imgs) - 1)
+
+    combined = np.zeros((total_height, max_width, 3), dtype=np.uint8)
+
+    y_offset = 0
+    for img in imgs:
+        h, w, _ = img.shape
+        combined[y_offset:y_offset + h, 0:w] = img
+        y_offset += h + 10
+
+    success, buffer = cv2.imencode(".png", combined)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to encode combined image")
+
+    bytes_io = io.BytesIO(buffer.tobytes())
+    return StreamingResponse(bytes_io, media_type="image/png")
