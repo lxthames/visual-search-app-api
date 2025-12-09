@@ -1,0 +1,110 @@
+{
+  "info": {
+    "name": "FastAPI /api Model Training & AvailableModel",
+    "_postman_id": "c2b4e1b2-1111-2222-3333-abcdefabcdef",
+    "description": "Collection for FastAPI endpoints: POST /api/ModelTraining and GET /api/AvailableModel",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Upload Single Query Image (/api/ModelTraining)",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "modelName",
+              "value": "example-model",
+              "type": "text"
+            },
+            {
+              "key": "skuDescription",
+              "value": "example sku description",
+              "type": "text"
+            },
+            {
+              "key": "skuId",
+              "value": "SKU-123",
+              "type": "text"
+            },
+            {
+              "key": "tenantId",
+              "value": "tenant-001",
+              "type": "text"
+            },
+            {
+              "key": "image",
+              "type": "file",
+              "src": ""
+            }
+          ]
+        },
+        "url": {
+          "raw": "http://127.0.0.1:8000/api/ModelTraining",
+          "protocol": "http",
+          "host": [
+            "127",
+            "0",
+            "0",
+            "1"
+          ],
+          "port": "8000",
+          "path": [
+            "api",
+            "ModelTraining"
+          ]
+        },
+        "description": "Upload a single query image with SKU and tenant info. Stores image as base64 in MongoDB."
+      },
+      "response": []
+    },
+    {
+      "name": "List Query Images (/api/AvailableModel)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://127.0.0.1:8000/api/AvailableModel?modelName=example-model",
+          "protocol": "http",
+          "host": [
+            "127",
+            "0",
+            "0",
+            "1"
+          ],
+          "port": "8000",
+          "path": [
+            "api",
+            "AvailableModel"
+          ],
+          "query": [
+            {
+              "key": "modelName",
+              "value": "example-model",
+              "description": "Required"
+            },
+            {
+              "key": "skuId",
+              "value": "",
+              "description": "Optional"
+            },
+            {
+              "key": "tenantId",
+              "value": "",
+              "description": "Optional"
+            },
+            {
+              "key": "skuDescription",
+              "value": "",
+              "description": "Optional"
+            }
+          ]
+        },
+        "description": "Return stored query images filtered by modelName (required) and optionally skuId, tenantId, skuDescription."
+      },
+      "response": []
+    }
+  ]
+}

@@ -7,6 +7,8 @@ import uuid
 import zipfile
 import base64
 from datetime import datetime
+import tempfile
+from pathlib import Path  
 from pymongo.errors import OperationFailure
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -15,7 +17,9 @@ from PIL import Image
 import cv2
 import numpy as np
 import pymongo
-
+from app.services.yolo_v11_detection import run_yolo_v11_detection
+from functools import lru_cache
+from ultralytics import YOLO
 from app.core.config import settings
 from app.services.vectorizer import get_vectorizer
 from app.services.datastore import get_datastore
@@ -60,7 +64,23 @@ class SingleQueryImageOut(BaseModel):
     skuDescription: Optional[str] = None
     skuId: Optional[str] = None
     tenantId: Optional[str] = None
+    clientId: Optional[str] = None
+    categoryId: Optional[str] = None
+    brandId: Optional[str] = None
     image_base64: str
+
+
+class YoloDetectionItem(BaseModel):
+    bbox: List[int]          # [x1, y1, x2, y2]
+    confidence: float
+    class_id: int
+    class_name: str
+
+
+class YoloDetectionResponse(BaseModel):
+    detections: List[YoloDetectionItem]
+    annotated_image_base64: str
+
 
 
 # ===========================
@@ -482,29 +502,150 @@ def get_single_query_images_collection():
     except Exception:
         raise HTTPException(status_code=500, detail="Failed to connect to MongoDB")
 
+@lru_cache(maxsize=1)
+def get_yolo_v11_model() -> YOLO:
+    # USE YOUR ACTUAL FILE PATH HERE
+    model_path = "models/yolo/yolo_v11_best.pt"
+    # or an absolute path if necessary, but keep it the same as Colab’s weights
+    return YOLO(model_path)
+
+@router.post("/index-shelf-yolo", response_model=IndexShelfResponse)
+async def index_shelf_yolo(
+    file: UploadFile = File(...),
+    box_thresh: float = 0.2,
+):
+    """
+    Upload a full shelf image, detect objects with YOLO v11,
+    and index them in the vector DB as a new shelf (identified by image_id).
+    """
+    if not (0.0 <= box_thresh <= 1.0):
+        raise HTTPException(status_code=400, detail="box_thresh must be between 0.0 and 1.0")
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    # Save uploaded file to a temp path (so YOLO uses 'source=path' like in Colab)
+    try:
+        suffix = Path(file.filename).suffix or ".jpg"
+    except Exception:
+        suffix = ".jpg"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
+
+    # Also load as PIL for cropping and saving shelf image
+    try:
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image file")
+
+    model = get_yolo_v11_model()
+
+    # --- YOLO PREDICT (Colab-style) ---
+    results = model.predict(
+        source=tmp_path,        # <--- path, same as Colab pattern
+        imgsz=640,
+        conf=box_thresh,        # equivalent of confidence threshold
+        save=False,             # we handle saving ourselves
+        show_labels=False,
+        show_conf=False,
+        verbose=False,
+    )
+
+    if not results:
+        raise HTTPException(status_code=500, detail="YOLO v11 returned no results")
+
+    result = results[0]
+    boxes = result.boxes
+
+    # DEBUG: you can temporarily print or log this to verify
+    print("YOLO result:", result)
+    print("Number of boxes:", 0 if boxes is None else len(boxes))
+
+    image_id = str(uuid.uuid4())
+
+    # If no detections, still save shelf image but index zero
+    if boxes is None or len(boxes) == 0:
+        shelves_dir = settings.SHELF_DIR
+        shelves_dir.mkdir(parents=True, exist_ok=True)
+        out_path = shelves_dir / f"{image_id}.png"
+        image.save(out_path)
+
+        return IndexShelfResponse(
+            image_id=image_id,
+            num_detections=0,
+            num_indexed=0,
+        )
+
+    vectorizer = get_vectorizer()
+    datastore = get_datastore()
+
+    num_indexed = 0
+    names = result.names  # {class_id: class_name}
+
+    for i in range(len(boxes)):
+        box = boxes[i]
+
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        conf = float(box.conf[0])
+        class_id = int(box.cls[0])
+        label = names.get(class_id, str(class_id))
+
+        bbox_list = [int(x1), int(y1), int(x2), int(y2)]
+
+        crop = image.crop((bbox_list[0], bbox_list[1], bbox_list[2], bbox_list[3]))
+        vector = vectorizer.get_image_embedding(crop)
+        crop_id = str(uuid.uuid4())
+
+        datastore.save_object(
+            image_id=image_id,
+            crop_id=crop_id,
+            vector=vector,
+            metadata={
+                "bbox": bbox_list,
+                "label": label,
+                "confidence": conf,
+            },
+        )
+        num_indexed += 1
+
+    shelves_dir = settings.SHELF_DIR
+    shelves_dir.mkdir(parents=True, exist_ok=True)
+    out_path = shelves_dir / f"{image_id}.png"
+    image.save(out_path)
+
+    return IndexShelfResponse(
+        image_id=image_id,
+        num_detections=len(boxes),
+        num_indexed=num_indexed,
+    )
 
 
-
-@router.post("/query-images/upload")
+@router.post("/ModelTraining")
 async def upload_single_query_image(
     modelName: str = Form(...),
     skuDescription: str = Form(...),
     skuId: str = Form(...),
     tenantId: str = Form(...),
+
+    # NEW optional fields (only these three are optional)
+    clientId: str | None = Form(None),
+    categoryId: str | None = Form(None),
+    brandId: str | None = Form(None),
+
     image: UploadFile = File(...),
 ):
     """Upload a single query image with SKU + tenant info and store in MongoDB (base64)."""
     if not settings.MONGO_URI:
         raise HTTPException(status_code=500, detail="MongoDB URI is not configured")
 
-    # 取得 collection（沿用你的 helper）
     collection = get_single_query_images_collection()
 
-    # 基本檔案驗證（可依需求調整）
     if image.content_type is None or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image uploads are allowed")
 
-    # 可選：限制檔案大小，例如 5MB
     MAX_SIZE = 5 * 1024 * 1024
     file_bytes = await image.read()
     if len(file_bytes) > MAX_SIZE:
@@ -519,13 +660,15 @@ async def upload_single_query_image(
         "skuDescription": skuDescription,
         "skuId": skuId,
         "tenantId": tenantId,
+        "clientId": clientId,
+        "categoryId": categoryId,
+        "brandId": brandId,
         "filename": image.filename,
         "content_type": image.content_type,
         "image_base64": image_b64,
         "created_at": datetime.utcnow(),
     }
 
-    # Insert into MongoDB and handle permission errors
     try:
         result = collection.insert_one(document)
     except OperationFailure as e:
@@ -545,59 +688,61 @@ async def upload_single_query_image(
 
 
 
-@router.get("/query-images", response_model=List[SingleQueryImageOut])
+
+
+@router.get("/AvailableModel", response_model=List[SingleQueryImageOut])
 async def list_query_images(
     modelName: str,
     skuId: str | None = None,
     tenantId: str | None = None,
     skuDescription: str | None = None,
+    clientId: str | None = None,
+    categoryId: str | None = None,
+    brandId: str | None = None,
 ):
     """
     Return stored query images filtered by:
     - required: modelName
-    - optional: skuId, tenantId, skuDescription
+    - optional: skuId, tenantId, skuDescription, clientId, categoryId, brandId
     """
     collection = get_single_query_images_collection()
 
     # Build MongoDB query dynamically
     query: Dict[str, str] = {"modelName": modelName}
-    if skuId is not None:
+
+    if skuId:
         query["skuId"] = skuId
-    if tenantId is not None:
+    if tenantId:
         query["tenantId"] = tenantId
-    if skuDescription is not None:
+    if skuDescription:
         query["skuDescription"] = skuDescription
+    if clientId:
+        query["clientId"] = clientId
+    if categoryId:
+        query["categoryId"] = categoryId
+    if brandId:
+        query["brandId"] = brandId
 
     try:
         docs = list(collection.find(query))
     except OperationFailure as e:
-        try:
-            errmsg = e.details.get("errmsg", "")
-        except Exception:
-            errmsg = str(e)
-        raise HTTPException(
-            status_code=500,
-            detail=f"MongoDB read error: {errmsg}",
-        )
+        errmsg = getattr(e, "details", {}).get("errmsg", str(e))
+        raise HTTPException(status_code=500, detail=f"MongoDB read error: {errmsg}")
 
     results: List[SingleQueryImageOut] = []
 
     for doc in docs:
-        _id = str(doc.get("_id"))
-        model_name = doc.get("modelName", "")
-        sku_description = doc.get("skuDescription")
-        sku_id = doc.get("skuId")
-        tenant_id = doc.get("tenantId")
-        image_b64 = doc.get("image_base64", "")
-
         results.append(
             SingleQueryImageOut(
-                id=_id,
-                modelName=model_name,
-                skuDescription=sku_description,
-                skuId=sku_id,
-                tenantId=tenant_id,
-                image_base64=image_b64,
+                id=str(doc.get("_id")),
+                modelName=doc.get("modelName", ""),
+                skuDescription=doc.get("skuDescription"),
+                skuId=doc.get("skuId"),
+                tenantId=doc.get("tenantId"),
+                clientId=doc.get("clientId"),
+                categoryId=doc.get("categoryId"),
+                brandId=doc.get("brandId"),
+                image_base64=doc.get("image_base64", "")
             )
         )
 
@@ -774,6 +919,250 @@ async def search_visual_by_model(
         return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
 
     # 5. Mode B: One combined PNG (stacked vertically)
+    imgs = list(annotated_images.values())
+
+    widths = [img.shape[1] for img in imgs]
+    heights = [img.shape[0] for img in imgs]
+    max_width = max(widths)
+    total_height = sum(heights) + 10 * (len(imgs) - 1)
+
+    combined = np.zeros((total_height, max_width, 3), dtype=np.uint8)
+
+    y_offset = 0
+    for img in imgs:
+        h, w, _ = img.shape
+        combined[y_offset:y_offset + h, 0:w] = img
+        y_offset += h + 10
+
+    success, buffer = cv2.imencode(".png", combined)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to encode combined image")
+
+    bytes_io = io.BytesIO(buffer.tobytes())
+    return StreamingResponse(bytes_io, media_type="image/png")
+
+
+# ===========================
+# YOLO v11 Detection Endpoint
+# ===========================
+
+@router.post("/yolo-v11/detect", response_model=YoloDetectionResponse)
+async def yolo_v11_detect(
+    file: UploadFile = File(...),
+    conf_threshold: float = 0.25,
+    iou_threshold: float = 0.45,
+):
+    """
+    Use YOLO v11 (ultralytics) to detect objects in a single image.
+    """
+    contents = await file.read()
+    try:
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image file")
+
+    if not (0.0 <= conf_threshold <= 1.0):
+        raise HTTPException(status_code=400, detail="conf_threshold must be between 0.0 and 1.0")
+    if not (0.0 <= iou_threshold <= 1.0):
+        raise HTTPException(status_code=400, detail="iou_threshold must be between 0.0 and 1.0")
+
+    try:
+        result = run_yolo_v11_detection(
+            image=image,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    detections = [
+        YoloDetectionItem(
+            bbox=d["bbox"],
+            confidence=d["confidence"],
+            class_id=d["class_id"],
+            class_name=d["class_name"],
+        )
+        for d in result["detections"]
+    ]
+
+    return YoloDetectionResponse(
+        detections=detections,
+        annotated_image_base64=result["annotated_image_base64"],
+    )
+
+
+
+
+
+@router.get("/search-visual-by-available")
+async def search_visual_by_available(
+    modelName: str,
+    skuId: str | None = None,
+    tenantId: str | None = None,
+    skuDescription: str | None = None,
+    clientId: str | None = None,
+    categoryId: str | None = None,
+    brandId: str | None = None,
+    match_threshold: float = 0.19,
+    only_matches: bool = True,
+    as_zip: bool = False,
+):
+    """
+    Use stored single query images (AvailableModel) as queries to search
+    across all shelves.
+
+    - Required filter: modelName
+    - Optional filters: skuId, tenantId, skuDescription, clientId, categoryId, brandId
+    - Returns:
+      - if as_zip = False: one big PNG with all matching shelves stacked vertically
+      - if as_zip = True: ZIP file with one PNG per shelf
+    """
+
+    # 1) Load matching query images from Mongo
+    collection = get_single_query_images_collection()
+
+    query: Dict[str, str] = {"modelName": modelName}
+    if skuId:
+        query["skuId"] = skuId
+    if tenantId:
+        query["tenantId"] = tenantId
+    if skuDescription:
+        query["skuDescription"] = skuDescription
+    if clientId:
+        query["clientId"] = clientId
+    if categoryId:
+        query["categoryId"] = categoryId
+    if brandId:
+        query["brandId"] = brandId
+
+    docs = list(collection.find(query))
+    if not docs:
+        raise HTTPException(status_code=404, detail="No matching AvailableModel entries found")
+
+    vectorizer = get_vectorizer()
+    datastore = get_datastore()
+
+    # Collect all matches from all query images
+    matches: List[MatchResult] = []
+
+    # Internal per-query limit; no max_results parameter is exposed to user
+    PER_QUERY_LIMIT = 1000  # adjust as needed for your data size
+
+    for doc in docs:
+        image_b64 = doc.get("image_base64")
+        if not image_b64:
+            continue
+
+        try:
+            image_bytes = base64.b64decode(image_b64)
+            img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except Exception:
+            # Skip broken images
+            continue
+
+        query_vector = vectorizer.get_image_embedding(img)
+
+        # Query vector store for this query image
+        results = datastore.query_similar(
+            query_vector,
+            n_results=PER_QUERY_LIMIT,
+        )
+
+        for res in results:
+            data = res["data"]
+            parent_id = data.get("parent_image_id")
+            if parent_id is None:
+                continue
+
+            score = res["score"]
+            if only_matches and score > match_threshold:
+                continue
+
+            bbox = data.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+
+            matches.append(
+                MatchResult(
+                    shelf_id=parent_id,
+                    bbox=bbox,
+                    score=score,
+                )
+            )
+
+    if not matches:
+        raise HTTPException(status_code=404, detail="No sufficiently good matches found")
+
+    # ------------------------------
+    # Same drawing logic as /search-visual-multi
+    # ------------------------------
+    shelf_to_matches: Dict[str, List[MatchResult]] = defaultdict(list)
+    for m in matches:
+        shelf_to_matches[m.shelf_id].append(m)
+
+    for sid in shelf_to_matches:
+        shelf_to_matches[sid].sort(key=lambda m: m.score)
+
+    shelves_dir = settings.SHELF_DIR
+    annotated_images: Dict[str, np.ndarray] = {}
+
+    for shelf_id, shelf_matches in shelf_to_matches.items():
+        shelf_path = shelves_dir / f"{shelf_id}.png"
+        if not shelf_path.exists():
+            continue
+
+        shelf_img = cv2.imread(str(shelf_path))
+        if shelf_img is None:
+            continue
+
+        for m in shelf_matches:
+            x1, y1, x2, y2 = m.bbox
+
+            cv2.rectangle(
+                shelf_img,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2,
+            )
+
+            cv2.putText(
+                shelf_img,
+                f"{m.score:.2f}",
+                (x1, max(y1 - 10, 0)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+        annotated_images[shelf_id] = shelf_img
+
+    if not annotated_images:
+        raise HTTPException(status_code=404, detail="No shelf images found on disk")
+
+    # Mode A: ZIP
+    if as_zip:
+        import zipfile
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for shelf_id, img in annotated_images.items():
+                success, buffer = cv2.imencode(".png", img)
+                if not success:
+                    continue
+                png_bytes = buffer.tobytes()
+                filename = f"{shelf_id}.png"
+                zipf.writestr(filename, png_bytes)
+
+        zip_buffer.seek(0)
+        headers = {
+            "Content-Disposition": 'attachment; filename="search_results_by_available.zip"',
+        }
+        return StreamingResponse(zip_buffer, media_type="application/zip", headers=headers)
+
+    # Mode B: single combined PNG
     imgs = list(annotated_images.values())
 
     widths = [img.shape[1] for img in imgs]

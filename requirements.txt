@@ -17,3 +17,5 @@ python-dotenv
 python-multipart
 
 pymilvus
+
+supervision
