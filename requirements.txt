@@ -19,3 +19,4 @@ python-multipart
 pymilvus
 
 supervision
+ultralytics

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -38,6 +39,8 @@ class DataStore:
         self.local_meta: List[Dict[str, Any]] = []
         self.local_meta_path = Path(settings.METADATA_PATH)
         self.local_meta_path.parent.mkdir(parents=True, exist_ok=True)
+        # Thread lock for thread-safe local metadata operations
+        self._local_meta_lock = threading.Lock()
 
         if mongo_uri:
             try:
@@ -187,7 +190,7 @@ class DataStore:
                 [vector],
             ]
             self.milvus_collection.insert(data)
-            self.milvus_collection.flush()
+            # Don't flush here - flush only in batch operations
         else:
             self.vector_collection.add(
                 embeddings=[vector],
@@ -209,8 +212,70 @@ class DataStore:
         if self.use_mongo and self.mongo_coll is not None:
             self.mongo_coll.insert_one(record)
         else:
-            self.local_meta.append(record)
-            self._save_local_meta()
+            # Thread-safe append and save for local JSON storage
+            with self._local_meta_lock:
+                self.local_meta.append(record)
+                self._save_local_meta()
+
+    def batch_save_objects(
+        self,
+        image_id: str,
+        objects: List[Dict[str, Any]],  # List of {crop_id, vector, metadata}
+    ) -> None:
+        """
+        Batch save multiple objects to database. Much faster than individual saves.
+        objects: List of dicts with keys: crop_id, vector, metadata
+        """
+        if not objects:
+            return
+
+        # 1. Batch save vectors
+        if self.vector_backend == "milvus":
+            # Prepare batch data for Milvus
+            crop_ids = [obj["crop_id"] for obj in objects]
+            vectors = [obj["vector"] for obj in objects]
+            
+            data = [
+                crop_ids,
+                vectors,
+            ]
+            self.milvus_collection.insert(data)
+            # Flush once at the end for the entire batch
+            self.milvus_collection.flush()
+        else:
+            # Batch add to Chroma
+            crop_ids = [obj["crop_id"] for obj in objects]
+            vectors = [obj["vector"] for obj in objects]
+            metadatas = [{"mongo_id": crop_id} for crop_id in crop_ids]
+            
+            self.vector_collection.add(
+                embeddings=vectors,
+                metadatas=metadatas,
+                ids=crop_ids,
+            )
+
+        # 2. Prepare metadata records
+        records = []
+        for obj in objects:
+            record = {
+                "_id": obj["crop_id"],
+                "parent_image_id": image_id,
+                "label": str(obj["metadata"].get("label", "")),
+                "confidence": obj["metadata"].get("confidence"),
+                "bbox": obj["metadata"].get("bbox"),
+                "timestamp": datetime.now().isoformat(),
+            }
+            records.append(record)
+
+        # 3. Batch save metadata
+        if self.use_mongo and self.mongo_coll is not None:
+            # Batch insert to MongoDB
+            self.mongo_coll.insert_many(records)
+        else:
+            # Thread-safe batch append for local JSON storage
+            with self._local_meta_lock:
+                self.local_meta.extend(records)
+                self._save_local_meta()
 
     def query_similar(self, query_vector: List[float], n_results: int = 10) -> List[Dict[str, Any]]:
         if self.vector_backend == "milvus":

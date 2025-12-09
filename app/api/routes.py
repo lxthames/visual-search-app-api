@@ -17,6 +17,7 @@ from PIL import Image
 import cv2
 import numpy as np
 import pymongo
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.services.yolo_v11_detection import run_yolo_v11_detection
 from functools import lru_cache
 from ultralytics import YOLO
@@ -31,6 +32,44 @@ router = APIRouter()
 @router.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+# ===========================
+# Helper function for parallel processing
+# ===========================
+
+def extract_embedding_only(
+    crop: Image.Image,
+    bbox_list: List[int],
+    label: str,
+    conf: float,
+    vectorizer,
+) -> Dict[str, Any]:
+    """
+    Extract embedding from a single crop (no database save).
+    This function is designed to be run in parallel threads.
+    Returns: dict with vector, bbox_list, label, conf, crop_id
+    """
+    try:
+        # Extract embedding
+        vector = vectorizer.get_image_embedding(crop)
+        
+        # Generate unique ID
+        crop_id = str(uuid.uuid4())
+        
+        return {
+            "crop_id": crop_id,
+            "vector": vector,
+            "metadata": {
+                "bbox": bbox_list,
+                "label": label,
+                "confidence": conf,
+            },
+            "bbox_list": bbox_list,
+        }
+    except Exception as e:
+        print(f"Error extracting embedding: {e}")
+        return None
 
 
 # ===========================
@@ -112,9 +151,8 @@ async def index_shelf(
     vectorizer = get_vectorizer()
     datastore = get_datastore()
 
-    all_bboxes: List[List[int]] = []
-    num_indexed = 0
-
+    # Prepare all crops and metadata for parallel processing
+    crop_tasks = []
     for i in range(len(detections.xyxy)):
         box = detections.xyxy[i]
         label = detections.data["class_name"][i]
@@ -127,26 +165,41 @@ async def index_shelf(
         x1, y1, x2, y2 = bbox_list
         crop = image.crop((x1, y1, x2, y2))
 
-        # Get vector
-        vector = vectorizer.get_image_embedding(crop)
+        crop_tasks.append((crop, bbox_list, label, conf))
 
-        # Make a unique ID for this object
-        crop_id = str(uuid.uuid4())
-
-        # Save vector + metadata
-        datastore.save_object(
-            image_id=image_id,
-            crop_id=crop_id,
-            vector=vector,
-            metadata={
-                "bbox": bbox_list,
-                "label": label,
-                "confidence": conf,
-            },
-        )
-
-        all_bboxes.append(bbox_list)
-        num_indexed += 1
+    # Step 1: Extract embeddings in parallel (no database operations)
+    all_bboxes: List[List[int]] = []
+    objects_to_save: List[Dict[str, Any]] = []
+    
+    # Use ThreadPoolExecutor for parallel embedding extraction
+    max_workers = min(len(crop_tasks), 8)  # Limit to 8 threads
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all embedding extraction tasks
+        futures = [
+            executor.submit(
+                extract_embedding_only,
+                crop,
+                bbox_list,
+                label,
+                conf,
+                vectorizer,
+            )
+            for crop, bbox_list, label, conf in crop_tasks
+        ]
+        
+        # Collect results as they complete
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                objects_to_save.append(result)
+                all_bboxes.append(result["bbox_list"])
+    
+    # Step 2: Batch save all objects to database at once (much faster!)
+    if objects_to_save:
+        datastore.batch_save_objects(image_id, objects_to_save)
+    
+    num_indexed = len(objects_to_save)
 
     # Save this shelf image to disk under its image_id
     shelves_dir = settings.SHELF_DIR
@@ -582,9 +635,10 @@ async def index_shelf_yolo(
     vectorizer = get_vectorizer()
     datastore = get_datastore()
 
-    num_indexed = 0
     names = result.names  # {class_id: class_name}
 
+    # Prepare all crops and metadata for parallel processing
+    crop_tasks = []
     for i in range(len(boxes)):
         box = boxes[i]
 
@@ -594,22 +648,41 @@ async def index_shelf_yolo(
         label = names.get(class_id, str(class_id))
 
         bbox_list = [int(x1), int(y1), int(x2), int(y2)]
-
         crop = image.crop((bbox_list[0], bbox_list[1], bbox_list[2], bbox_list[3]))
-        vector = vectorizer.get_image_embedding(crop)
-        crop_id = str(uuid.uuid4())
+        
+        crop_tasks.append((crop, bbox_list, label, conf))
 
-        datastore.save_object(
-            image_id=image_id,
-            crop_id=crop_id,
-            vector=vector,
-            metadata={
-                "bbox": bbox_list,
-                "label": label,
-                "confidence": conf,
-            },
-        )
-        num_indexed += 1
+    # Step 1: Extract embeddings in parallel (no database operations)
+    objects_to_save: List[Dict[str, Any]] = []
+    
+    # Use ThreadPoolExecutor for parallel embedding extraction
+    max_workers = min(len(crop_tasks), 8)  # Limit to 8 threads
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all embedding extraction tasks
+        futures = [
+            executor.submit(
+                extract_embedding_only,
+                crop,
+                bbox_list,
+                label,
+                conf,
+                vectorizer,
+            )
+            for crop, bbox_list, label, conf in crop_tasks
+        ]
+        
+        # Collect results as they complete
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                objects_to_save.append(result)
+    
+    # Step 2: Batch save all objects to database at once (much faster!)
+    if objects_to_save:
+        datastore.batch_save_objects(image_id, objects_to_save)
+    
+    num_indexed = len(objects_to_save)
 
     shelves_dir = settings.SHELF_DIR
     shelves_dir.mkdir(parents=True, exist_ok=True)

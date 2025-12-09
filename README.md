@@ -68,14 +68,22 @@ Common Python dependencies (see `requirements.txt` in the repo for the full list
 
 ## Running the Application
 
-Run the FastAPI app with **uvicorn**:
+Run the FastAPI app with a simple Python command:
 
+```bash
+python run.py
+```
+
+This will start the server with:
+* Auto-reload enabled for development
+* Host: `0.0.0.0` (accessible from all network interfaces)
+* Port: `8000`
+* The API will be available at: `http://localhost:8000`
+
+**Alternative:** You can also run it directly with uvicorn if needed:
 ```bash
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
-
-* `--reload` enables auto-reload during development
-* The API will be available at: `http://localhost:8000`
 
 ---
 
