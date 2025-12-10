@@ -1,0 +1,258 @@
+{
+  "_type": "export",
+  "__export_format": 4,
+  "__export_date": "2024-01-01T00:00:00.000Z",
+  "__export_source": "insomnia.desktop.app:v2023.5.8",
+  "resources": [
+    {
+      "_id": "req_health_check",
+      "parentId": "fld_visual_search_api",
+      "modified": 1704067200000,
+      "created": 1704067200000,
+      "url": "http://localhost:8000/api/health",
+      "name": "Health Check",
+      "description": "Check if the API server is running and healthy",
+      "method": "GET",
+      "body": {},
+      "parameters": [],
+      "headers": [],
+      "authentication": {},
+      "metaSortKey": 1000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_type": "request"
+    },
+    {
+      "_id": "req_index_shelf",
+      "parentId": "fld_visual_search_api",
+      "modified": 1704067200000,
+      "created": 1704067200000,
+      "url": "http://localhost:8000/api/index-shelf?prompt=Bottle&box_thresh=0.3",
+      "name": "Index Shelf",
+      "description": "Upload a shelf image to detect and index objects. Detects objects using GroundingDINO and stores them in the vector database.\n\n**Parameters:**\n- `prompt` (query param): Text prompt for object detection (default: \"Bottle\")\n- `box_thresh` (query param): Detection threshold 0.0-1.0 (default: 0.3)\n- `file` (form-data): Image file to upload\n\n**Response:** Returns shelf_id, number of detections, and number of indexed objects",
+      "method": "POST",
+      "body": {
+        "mimeType": "multipart/form-data",
+        "params": [
+          {
+            "id": "pair_file",
+            "name": "file",
+            "value": "",
+            "description": "Select an image file (PNG, JPG, etc.)",
+            "type": "file",
+            "fileName": ""
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "id": "param_prompt",
+          "name": "prompt",
+          "value": "Bottle",
+          "description": "Text prompt for object detection (e.g., 'Bottle', 'Can', 'Product')",
+          "disabled": false
+        },
+        {
+          "id": "param_box_thresh",
+          "name": "box_thresh",
+          "value": "0.3",
+          "description": "Detection threshold between 0.0 and 1.0",
+          "disabled": false
+        }
+      ],
+      "headers": [],
+      "authentication": {},
+      "metaSortKey": 2000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_type": "request"
+    },
+    {
+      "_id": "req_list_shelves",
+      "parentId": "fld_visual_search_api",
+      "modified": 1704067200000,
+      "created": 1704067200000,
+      "url": "http://localhost:8000/api/shelves",
+      "name": "List Shelves",
+      "description": "Get a list of all indexed shelves with the number of objects in each shelf.\n\n**Response:** Array of shelves with shelf_id and num_objects",
+      "method": "GET",
+      "body": {},
+      "parameters": [],
+      "headers": [],
+      "authentication": {},
+      "metaSortKey": 3000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_type": "request"
+    },
+    {
+      "_id": "req_search_similar",
+      "parentId": "fld_visual_search_api",
+      "modified": 1704067200000,
+      "created": 1704067200000,
+      "url": "http://localhost:8000/api/search?shelf_id=&max_results=10&match_threshold=0.19",
+      "name": "Search Similar (JSON)",
+      "description": "Search for visually similar objects on a specific shelf. Returns JSON with bounding boxes and similarity scores.\n\n**Parameters:**\n- `shelf_id` (query param): The ID of the shelf to search in (get from List Shelves endpoint)\n- `max_results` (query param): Maximum number of results (default: 10)\n- `match_threshold` (query param): Maximum distance threshold (default: 0.19, lower = more similar)\n- `file` (form-data): Query image to search for\n\n**Response:** JSON array of matches with bbox coordinates and similarity scores",
+      "method": "POST",
+      "body": {
+        "mimeType": "multipart/form-data",
+        "params": [
+          {
+            "id": "pair_file",
+            "name": "file",
+            "value": "",
+            "description": "Query image to search for",
+            "type": "file",
+            "fileName": ""
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "id": "param_shelf_id",
+          "name": "shelf_id",
+          "value": "",
+          "description": "Shelf ID from List Shelves endpoint",
+          "disabled": false
+        },
+        {
+          "id": "param_max_results",
+          "name": "max_results",
+          "value": "10",
+          "description": "Maximum number of results to return",
+          "disabled": false
+        },
+        {
+          "id": "param_match_threshold",
+          "name": "match_threshold",
+          "value": "0.19",
+          "description": "Maximum distance threshold (lower = more similar)",
+          "disabled": false
+        }
+      ],
+      "headers": [],
+      "authentication": {},
+      "metaSortKey": 4000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_type": "request"
+    },
+    {
+      "_id": "req_search_visual",
+      "parentId": "fld_visual_search_api",
+      "modified": 1704067200000,
+      "created": 1704067200000,
+      "url": "http://localhost:8000/api/search-visual?shelf_id=&max_results=10&match_threshold=0.19",
+      "name": "Search Similar (Visual)",
+      "description": "Search for visually similar objects and get back the shelf image with matches highlighted.\n\n**Parameters:**\n- `shelf_id` (query param): The ID of the shelf to search in\n- `max_results` (query param): Maximum number of results (default: 10)\n- `match_threshold` (query param): Maximum distance threshold (default: 0.19)\n- `file` (form-data): Query image to search for\n\n**Response:** PNG image with bounding boxes:\n- GREEN boxes = matches (score < threshold)\n- RED boxes = non-matches (score >= threshold)\n- Score displayed above each box",
+      "method": "POST",
+      "body": {
+        "mimeType": "multipart/form-data",
+        "params": [
+          {
+            "id": "pair_file",
+            "name": "file",
+            "value": "",
+            "description": "Query image to search for",
+            "type": "file",
+            "fileName": ""
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "id": "param_shelf_id",
+          "name": "shelf_id",
+          "value": "",
+          "description": "Shelf ID from List Shelves endpoint",
+          "disabled": false
+        },
+        {
+          "id": "param_max_results",
+          "name": "max_results",
+          "value": "10",
+          "description": "Maximum number of results to return",
+          "disabled": false
+        },
+        {
+          "id": "param_match_threshold",
+          "name": "match_threshold",
+          "value": "0.19",
+          "description": "Maximum distance threshold (lower = more similar)",
+          "disabled": false
+        }
+      ],
+      "headers": [],
+      "authentication": {},
+      "metaSortKey": 5000000000000,
+      "isPrivate": false,
+      "settingStoreCookies": true,
+      "settingSendCookies": true,
+      "settingDisableRenderRequestBody": false,
+      "settingEncodeUrl": true,
+      "settingRebuildPath": true,
+      "settingFollowRedirects": "global",
+      "_type": "request"
+    },
+    {
+      "_id": "fld_visual_search_api",
+      "parentId": null,
+      "modified": 1704067200000,
+      "created": 1704067200000,
+      "name": "Visual Search API",
+      "description": "API collection for Visual Search application\n\nBase URL: http://localhost:8000\n\nThis API allows you to:\n1. Index shelf images with object detection\n2. Search for visually similar objects\n3. Get visual results with highlighted matches",
+      "environment": {},
+      "environmentPropertyOrder": null,
+      "metaSortKey": 1000000000000,
+      "_type": "request_group"
+    },
+    {
+      "_id": "env_base",
+      "parentId": "env_base",
+      "modified": 1704067200000,
+      "created": 1704067200000,
+      "name": "Base Environment",
+      "data": {
+        "base_url": "http://localhost:8000"
+      },
+      "dataPropertyOrder": {
+        "&": ["base_url"]
+      },
+      "color": null,
+      "isPrivate": false,
+      "metaSortKey": 1000000000000,
+      "_type": "environment"
+    },
+    {
+      "_id": "wrk_visual_search",
+      "parentId": null,
+      "modified": 1704067200000,
+      "created": 1704067200000,
+      "name": "Visual Search API Workspace",
+      "description": "",
+      "scope": null,
+      "_type": "workspace"
+    }
+  ]
+}
+
