@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>YOLO v11 Detection Demo</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 960px;
+      margin: 32px auto;
+      padding: 0 16px;
+    }
+
+    h1 {
+      font-size: 24px;
+      margin-bottom: 8px;
+    }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 24px;
+      margin-top: 16px;
+    }
+
+    .card {
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 16px;
+      flex: 1 1 320px;
+    }
+
+    img {
+      max-width: 100%;
+      border-radius: 4px;
+      border: 1px solid #e5e7eb;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th, td {
+      padding: 6px 8px;
+      border-bottom: 1px solid #f3f4f6;
+      text-align: left;
+    }
+
+    th {
+      border-bottom-color: #d1d5db;
+      font-weight: 600;
+    }
+
+    .error {
+      color: #b91c1c;
+      margin-top: 8px;
+      font-size: 13px;
+    }
+
+    .controls label {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 13px;
+    }
+
+    .controls input[type="range"] {
+      width: 100%;
+    }
+
+    button {
+      padding: 8px 16px;
+      border-radius: 4px;
+      border: none;
+      background: #2563eb;
+      color: white;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <h1>YOLO v11 Object Detection (FastAPI)</h1>
+  <p style="font-size: 14px; color: #6b7280;">
+    Upload an image and run Ultralytics YOLO v11 with supervision to visualize detections.
+  </p>
+
+  <div class="row">
+    <div class="card">
+      <h2 style="font-size: 16px; margin-top: 0;">Upload</h2>
+      <input type="file" id="imageInput" accept="image/*" />
+      <div id="uploadPreviewContainer" style="margin-top: 12px; display: none;">
+        <div style="font-size: 12px; margin-bottom: 4px;">Original image preview:</div>
+        <img id="uploadPreview" alt="original preview" />
+      </div>
+
+      <div class="controls" style="margin-top: 16px;">
+        <label for="confRange">Confidence threshold: <span id="confValue">0.25</span></label>
+        <input id="confRange" type="range" min="0" max="1" step="0.01" value="0.25" />
+
+        <label for="iouRange" style="margin-top: 12px;">IoU threshold: <span id="iouValue">0.45</span></label>
+        <input id="iouRange" type="range" min="0" max="1" step="0.01" value="0.45" />
+      </div>
+
+      <button id="runBtn" style="margin-top: 16px;">Run YOLO v11 detection</button>
+      <div id="errorBox" class="error" style="display: none;"></div>
+    </div>
+
+    <div class="card">
+      <h2 style="font-size: 16px; margin-top: 0;">Annotated Image</h2>
+      <div id="annotatedContainer" style="display: none; margin-top: 8px;">
+        <img id="annotatedImage" alt="annotated" />
+      </div>
+      <div id="noResultHint" style="font-size: 13px; color: #9ca3af;">
+        No result yet. Upload an image and click "Run YOLO v11 detection".
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 24px;">
+    <h2 style="font-size: 16px; margin-top: 0;">Detections</h2>
+    <div id="detectionsWrapper" style="font-size: 13px; color: #6b7280;">
+      No detections yet.
+    </div>
+  </div>
+
+  <script>
+    const imageInput = document.getElementById("imageInput");
+    const uploadPreviewContainer = document.getElementById("uploadPreviewContainer");
+    const uploadPreview = document.getElementById("uploadPreview");
+    const confRange = document.getElementById("confRange");
+    const iouRange = document.getElementById("iouRange");
+    const confValue = document.getElementById("confValue");
+    const iouValue = document.getElementById("iouValue");
+    const runBtn = document.getElementById("runBtn");
+    const errorBox = document.getElementById("errorBox");
+    const annotatedContainer = document.getElementById("annotatedContainer");
+    const annotatedImage = document.getElementById("annotatedImage");
+    const noResultHint = document.getElementById("noResultHint");
+    const detectionsWrapper = document.getElementById("detectionsWrapper");
+
+    let selectedFile = null;
+
+    imageInput.addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) {
+        selectedFile = null;
+        uploadPreviewContainer.style.display = "none";
+        return;
+      }
+      selectedFile = file;
+      const url = URL.createObjectURL(file);
+      uploadPreview.src = url;
+      uploadPreviewContainer.style.display = "block";
+    });
+
+    confRange.addEventListener("input", () => {
+      confValue.textContent = parseFloat(confRange.value).toFixed(2);
+    });
+
+    iouRange.addEventListener("input", () => {
+      iouValue.textContent = parseFloat(iouRange.value).toFixed(2);
+    });
+
+    runBtn.addEventListener("click", async () => {
+      if (!selectedFile) {
+        showError("Please select an image first.");
+        return;
+      }
+
+      clearError();
+      setLoading(true);
+
+      const conf = confRange.value;
+      const iou = iouRange.value;
+
+      const formData = new FormData();
+      formData.append("file", selectedFile);
+      formData.append("conf_threshold", conf);
+      formData.append("iou_threshold", iou);
+
+      try {
+        const response = await fetch("/api/yolo-v11/detect", {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(data.detail || "Detection failed");
+        }
+
+        const data = await response.json();
+        renderResult(data);
+      } catch (err) {
+        console.error(err);
+        showError(err.message || "Detection failed");
+      } finally {
+        setLoading(false);
+      }
+    });
+
+    function renderResult(data) {
+      // Annotated image
+      if (data.annotated_image_base64) {
+        annotatedImage.src = "data:image/png;base64," + data.annotated_image_base64;
+        annotatedContainer.style.display = "block";
+        noResultHint.style.display = "none";
+      }
+
+      // Detections table
+      const detections = data.detections || [];
+      if (detections.length === 0) {
+        detectionsWrapper.textContent = "No objects detected.";
+        return;
+      }
+
+      const rows = detections
+        .map((det, idx) => {
+          const bbox = det.bbox || [];
+          const bboxStr = `[${bbox.join(", ")}]`;
+          const confStr = (det.confidence || 0).toFixed(3);
+          const cls = `${det.class_name} (${det.class_id})`;
+          return `
+            <tr>
+              <td>${idx + 1}</td>
+              <td>${cls}</td>
+              <td>${confStr}</td>
+              <td>${bboxStr}</td>
+            </tr>
+          `;
+        })
+        .join("");
+
+      detectionsWrapper.innerHTML = `
+        <div style="margin-bottom: 8px;">
+          Detected ${detections.length} objects.
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Class</th>
+              <th>Confidence</th>
+              <th>BBox [x1, y1, x2, y2]</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function showError(msg) {
+      errorBox.textContent = msg;
+      errorBox.style.display = "block";
+    }
+
+    function clearError() {
+      errorBox.textContent = "";
+      errorBox.style.display = "none";
+    }
+
+    function setLoading(isLoading) {
+      runBtn.disabled = isLoading;
+      runBtn.textContent = isLoading ? "Running detection..." : "Run YOLO v11 detection";
+    }
+  </script>
+</body>
+</html>
