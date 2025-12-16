@@ -18,6 +18,12 @@ class Settings:
     # Let .env decide; if missing, we won't hardcode DB/collection in code.
     MONGO_DB_NAME: str | None = os.getenv("MONGO_DB_NAME") or None
     MONGO_COLLECTION_NAME: str | None = os.getenv("MONGO_COLLECTION_NAME") or None
+    # Test collection name (if set, will be used instead of MONGO_COLLECTION_NAME)
+    MONGO_COLLECTION_NAME_TEST: str | None = os.getenv("MONGO_COLLECTION_NAME_TEST") or None
+    # Single query images collection name
+    MONGO_SINGLE_QUERY_COLLECTION_NAME: str = os.getenv("MONGO_SINGLE_QUERY_COLLECTION_NAME", "single_query_images")
+    # Test single query images collection name (if set, will be used instead)
+    MONGO_SINGLE_QUERY_COLLECTION_NAME_TEST: str | None = os.getenv("MONGO_SINGLE_QUERY_COLLECTION_NAME_TEST") or None
 
     # --- Vector backend selection ---
     # "chroma" for local dev, "milvus" to use PyMilvus
@@ -36,6 +42,8 @@ class Settings:
     MILVUS_PASSWORD: str | None = os.getenv("MILVUS_PASSWORD") or None
     MILVUS_DB_NAME: str = os.getenv("MILVUS_DB_NAME", "default")
     MILVUS_COLLECTION_NAME: str = os.getenv("MILVUS_COLLECTION_NAME", "visual_search")
+    # Test collection name (if set, will be used instead of MILVUS_COLLECTION_NAME)
+    MILVUS_COLLECTION_NAME_TEST: str | None = os.getenv("MILVUS_COLLECTION_NAME_TEST") or None
 
     DEVICE: str = os.getenv("DEVICE", "auto")
 

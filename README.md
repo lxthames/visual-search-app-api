@@ -64,6 +64,28 @@ Common Python dependencies (see `requirements.txt` in the repo for the full list
 
    Then edit `.env` and fill in your values.
 
+   ### Test Collections Configuration
+
+   The application supports separate test collections for MongoDB and Milvus to allow testing without affecting production data.
+
+   **To use test collections**, add these variables to your `.env` file:
+
+   ```bash
+   # MongoDB Test Collections
+   MONGO_COLLECTION_NAME_TEST=products_test
+   MONGO_SINGLE_QUERY_COLLECTION_NAME_TEST=single_query_images_test
+
+   # Milvus Test Collection
+   MILVUS_COLLECTION_NAME_TEST=visual_search_test
+   ```
+
+   **To use production collections**, simply don't set the `_TEST` variables (or comment them out).
+
+   The application will automatically:
+   - Use test collections if `_TEST` variables are set
+   - Use production collections if `_TEST` variables are not set
+   - Print which collections are being used at startup
+
 ---
 
 ## Running the Application

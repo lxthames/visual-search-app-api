@@ -57,11 +57,17 @@ class DataStore:
                     except Exception:
                         mongo_db = mongo_client["cstore-ai"]
 
-                coll_name = (
-                    settings.MONGO_COLLECTION_NAME
-                    if getattr(settings, "MONGO_COLLECTION_NAME", None)
-                    else "products"
-                )
+                # Use test collection if specified, otherwise use production collection
+                if settings.MONGO_COLLECTION_NAME_TEST:
+                    coll_name = settings.MONGO_COLLECTION_NAME_TEST
+                    print(f"Using TEST MongoDB collection: {coll_name}")
+                else:
+                    coll_name = (
+                        settings.MONGO_COLLECTION_NAME
+                        if getattr(settings, "MONGO_COLLECTION_NAME", None)
+                        else "products"
+                    )
+                    print(f"Using PRODUCTION MongoDB collection: {coll_name}")
                 self.mongo_coll = mongo_db[coll_name]
                 self.use_mongo = True
             except Exception:
@@ -85,13 +91,20 @@ class DataStore:
         )
 
     def _init_milvus_vector_store(self) -> None:
-        """Initialize Milvus-based vector store (creates collection if missing)."""
+        """Initialize Milvus-based vector store (creates & loads collection if missing)."""
         host = settings.MILVUS_HOST
         port = settings.MILVUS_PORT
         username = settings.MILVUS_USERNAME
         password = settings.MILVUS_PASSWORD
         db_name = settings.MILVUS_DB_NAME
-        collection_name = settings.MILVUS_COLLECTION_NAME
+
+        # Use test collection if specified, otherwise use production collection
+        if settings.MILVUS_COLLECTION_NAME_TEST:
+            collection_name = settings.MILVUS_COLLECTION_NAME_TEST
+            print(f"Using TEST Milvus collection: {collection_name}")
+        else:
+            collection_name = settings.MILVUS_COLLECTION_NAME
+            print(f"Using PRODUCTION Milvus collection: {collection_name}")
 
         # Connect (alias 'default' reused by whole app)
         connections.connect(
@@ -107,6 +120,7 @@ class DataStore:
         # CLIP ViT-B/32 typically => 512-dim; keep as a code-level constant
         dim = 512
 
+        # Create or get collection
         if not utility.has_collection(collection_name):
             crop_id_field = FieldSchema(
                 name="crop_id",
@@ -130,7 +144,24 @@ class DataStore:
                 shards_num=2,
             )
         else:
-            self.milvus_collection = Collection(collection_name)
+            self.milvus_collection = Collection(
+                name=collection_name,
+                using="default",
+            )
+
+        # Ensure index exists (optional but recommended for performance)
+        if not self.milvus_collection.indexes:
+            self.milvus_collection.create_index(
+                field_name="embedding",
+                index_params={
+                    "index_type": "IVF_FLAT",  # adjust to your needs: IVF_SQ8, HNSW, etc.
+                    "metric_type": "L2",
+                    "params": {"nlist": 1024},
+                },
+            )
+
+        # CRITICAL: load collection into memory so .search() works
+        self.milvus_collection.load()
 
     # ---------- Shelf helpers ----------
 
@@ -234,7 +265,7 @@ class DataStore:
             # Prepare batch data for Milvus
             crop_ids = [obj["crop_id"] for obj in objects]
             vectors = [obj["vector"] for obj in objects]
-            
+
             data = [
                 crop_ids,
                 vectors,
@@ -247,7 +278,7 @@ class DataStore:
             crop_ids = [obj["crop_id"] for obj in objects]
             vectors = [obj["vector"] for obj in objects]
             metadatas = [{"mongo_id": crop_id} for crop_id in crop_ids]
-            
+
             self.vector_collection.add(
                 embeddings=vectors,
                 metadatas=metadatas,
@@ -279,7 +310,10 @@ class DataStore:
 
     def query_similar(self, query_vector: List[float], n_results: int = 10) -> List[Dict[str, Any]]:
         if self.vector_backend == "milvus":
-            search_params = {"metric_type": "L2", "params": {"nprobe": 10}}
+            # Defensive: ensure collection is loaded (cheap if already loaded)
+            self.milvus_collection.load()
+
+            search_params = {"metric_type": "L2", "params": {"nprobe": 32}}
             search_results = self.milvus_collection.search(
                 data=[query_vector],
                 anns_field="embedding",
@@ -327,6 +361,7 @@ class DataStore:
 
 # Singleton-style accessor
 _datastore_instance: DataStore | None = None
+
 
 def get_datastore() -> DataStore:
     global _datastore_instance

@@ -2,271 +2,417 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Visual Search Demo</title>
+  <title>CStore AI API Demo</title>
   <style>
     body {
-      font-family: Arial, sans-serif;
-      margin: 20px;
-      max-width: 900px;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #f5f5f5;
+      color: #333;
     }
-    h1, h2 {
-      margin-bottom: 0.5rem;
+    header {
+      background: #222;
+      color: #fff;
+      padding: 16px 24px;
     }
-    section {
-      border: 1px solid #ccc;
-      padding: 15px;
+    header h1 {
+      margin: 0;
+      font-size: 20px;
+    }
+    main {
+      padding: 24px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    .section {
+      background: #fff;
+      border-radius: 8px;
+      padding: 16px 20px;
       margin-bottom: 20px;
-      border-radius: 6px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08);
     }
-    label {
-      display: block;
-      margin-top: 8px;
+    .section h2 {
+      margin-top: 0;
+      font-size: 18px;
+      border-bottom: 1px solid #eee;
+      padding-bottom: 8px;
+      margin-bottom: 12px;
     }
-    input[type="text"],
-    input[type="number"] {
-      width: 200px;
+    .field-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 24px;
+      margin-bottom: 12px;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      min-width: 220px;
+      flex: 1 1 220px;
+    }
+    .field label {
+      font-size: 13px;
+      margin-bottom: 4px;
+      color: #555;
+    }
+    .field input,
+    .field select,
+    .field textarea {
+      padding: 6px 8px;
+      font-size: 14px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+    }
+    .field input[type="file"] {
+      padding: 4px 0;
     }
     button {
-      margin-top: 10px;
-      padding: 6px 12px;
+      padding: 8px 16px;
+      font-size: 14px;
+      border-radius: 4px;
+      border: none;
       cursor: pointer;
+      background: #007bff;
+      color: #fff;
     }
-    #result-image {
-      max-width: 100%;
+    button:hover {
+      opacity: 0.9;
+    }
+    .note {
+      font-size: 12px;
+      color: #777;
+    }
+    #health-result,
+    #index-shelf-result,
+    #model-training-result,
+    #available-model-result {
       margin-top: 10px;
-      border: 1px solid #ddd;
-    }
-    #shelves-list {
-      margin-top: 8px;
-      font-size: 0.9rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 13px;
       white-space: pre-wrap;
-    }
-    .small {
-      font-size: 0.8rem;
-      color: #555;
+      background: #f8f8f8;
+      padding: 8px;
+      border-radius: 4px;
+      border: 1px solid #eee;
+      max-height: 240px;
+      overflow: auto;
     }
   </style>
 </head>
 <body>
-  <h1>Visual Shelf Search</h1>
+<header>
+  <h1>CStore AI API Demo</h1>
+</header>
+<main>
 
-  <section>
-    <h2>1. Index Shelf</h2>
-    <p>Upload a shelf image and detect objects.</p>
-    <label>Shelf image:
-      <input type="file" id="shelf-file" accept="image/*" />
-    </label>
-    <label>Prompt:
-      <input type="text" id="prompt" value="Bottle" />
-    </label>
-    <label>Box threshold (0 - 1):
-      <input type="number" id="box-thresh" step="0.05" value="0.3" />
-    </label>
-    <button id="index-shelf-btn">Index Shelf</button>
-    <div id="index-result" class="small"></div>
+  <!-- Health Check -->
+  <section class="section">
+    <h2>/api/health</h2>
+    <p class="note">Simple health check to verify the FastAPI service is running.</p>
+    <button type="button" onclick="checkHealth()">Check Health</button>
+    <div id="health-result"></div>
   </section>
 
-  <section>
-    <h2>2. Shelves</h2>
-    <button id="refresh-shelves-btn">Refresh Shelves List</button>
-    <div id="shelves-list"></div>
+  <!-- /api/index-shelf-yolo -->
+  <section class="section">
+    <h2>/api/index-shelf-yolo</h2>
+    <p class="note">
+      Upload a full shelf image, run YOLO detection, and index all detected objects into the vector store.
+      The response includes image_id, number of detections, and number of indexed objects.
+    </p>
+    <form id="index-shelf-form">
+      <div class="field-group">
+        <div class="field">
+          <label for="index-shelf-file">Shelf Image (file)</label>
+          <input id="index-shelf-file" name="file" type="file" accept="image/*" required />
+        </div>
+        <div class="field">
+          <label for="index-shelf-thresh">box_thresh (0.0 ~ 1.0)</label>
+          <input id="index-shelf-thresh" name="box_thresh" type="number" step="0.01" min="0" max="1" value="0.2" />
+        </div>
+      </div>
+      <button type="submit">Upload &amp; Index</button>
+    </form>
+    <div id="index-shelf-result"></div>
   </section>
 
-  <section>
-    <h2>3. Search</h2>
-    <p>Upload a query image and search on a specific shelf.</p>
-    <label>Query image:
-      <input type="file" id="query-file" accept="image/*" />
-    </label>
-    <label>Shelf ID:
-      <input type="text" id="shelf-id-input" placeholder="Use last indexed if blank" />
-    </label>
-    <label>Max results:
-      <input type="number" id="max-results" value="10" />
-    </label>
-    <label>Match threshold (distance, smaller = more similar):
-      <input type="number" id="match-threshold" step="0.01" value="0.19" />
-    </label>
-    <div>
-      <button id="search-json-btn">Search (JSON)</button>
-      <button id="search-visual-btn">Search (Visual)</button>
-    </div>
-    <pre id="search-json-result"></pre>
-    <img id="result-image" alt="Visual search result" />
+  <!-- /api/ModelTraining -->
+  <section class="section">
+    <h2>/api/ModelTraining</h2>
+    <p class="note">
+      Upload a single query image (SKU image) with metadata and store it in MongoDB as base64.
+    </p>
+    <form id="model-training-form">
+      <div class="field-group">
+        <div class="field">
+          <label for="mt-modelName">modelName *</label>
+          <input id="mt-modelName" name="modelName" type="text" required />
+        </div>
+        <div class="field">
+          <label for="mt-skuDescription">skuDescription *</label>
+          <input id="mt-skuDescription" name="skuDescription" type="text" required />
+        </div>
+        <div class="field">
+          <label for="mt-skuId">skuId *</label>
+          <input id="mt-skuId" name="skuId" type="text" required />
+        </div>
+        <div class="field">
+          <label for="mt-tenantId">tenantId *</label>
+          <input id="mt-tenantId" name="tenantId" type="text" required />
+        </div>
+
+        <div class="field">
+          <label for="mt-clientId">clientId (optional)</label>
+          <input id="mt-clientId" name="clientId" type="text" />
+        </div>
+        <div class="field">
+          <label for="mt-categoryId">categoryId (optional)</label>
+          <input id="mt-categoryId" name="categoryId" type="text" />
+        </div>
+        <div class="field">
+          <label for="mt-brandId">brandId (optional)</label>
+          <input id="mt-brandId" name="brandId" type="text" />
+        </div>
+
+        <div class="field">
+          <label for="mt-image">Query Image *</label>
+          <input id="mt-image" name="image" type="file" accept="image/*" required />
+        </div>
+      </div>
+      <button type="submit">Upload Query Image</button>
+    </form>
+    <div id="model-training-result"></div>
   </section>
 
-  <script>
-    let lastShelfId = null;
+  <!-- /api/AvailableModel -->
+  <section class="section">
+    <h2>/api/AvailableModel</h2>
+    <p class="note">
+      List stored single-query images (AvailableModel) filtered by metadata. Returns metadata and image_base64.
+    </p>
+    <form id="available-model-form">
+      <div class="field-group">
+        <div class="field">
+          <label for="am-modelName">modelName *</label>
+          <input id="am-modelName" name="modelName" type="text" required />
+        </div>
+        <div class="field">
+          <label for="am-skuId">skuId (optional)</label>
+          <input id="am-skuId" name="skuId" type="text" />
+        </div>
+        <div class="field">
+          <label for="am-tenantId">tenantId (optional)</label>
+          <input id="am-tenantId" name="tenantId" type="text" />
+        </div>
+        <div class="field">
+          <label for="am-skuDescription">skuDescription (optional)</label>
+          <input id="am-skuDescription" name="skuDescription" type="text" />
+        </div>
+        <div class="field">
+          <label for="am-clientId">clientId (optional)</label>
+          <input id="am-clientId" name="clientId" type="text" />
+        </div>
+        <div class="field">
+          <label for="am-categoryId">categoryId (optional)</label>
+          <input id="am-categoryId" name="categoryId" type="text" />
+        </div>
+        <div class="field">
+          <label for="am-brandId">brandId (optional)</label>
+          <input id="am-brandId" name="brandId" type="text" />
+        </div>
+      </div>
+      <button type="submit">Search AvailableModel</button>
+    </form>
+    <div id="available-model-result"></div>
+  </section>
 
-    async function indexShelf() {
-      const fileInput = document.getElementById("shelf-file");
-      const promptInput = document.getElementById("prompt");
-      const boxInput = document.getElementById("box-thresh");
-      const resultDiv = document.getElementById("index-result");
+  <!-- /api/search-visual-by-available -->
+  <section class="section">
+    <h2>/api/search-visual-by-available</h2>
+    <p class="note">
+      Use the stored AvailableModel images as queries to search across all indexed shelves.<br />
+      If <code>as_zip = false</code>, returns a single combined PNG; if <code>as_zip = true</code>, returns a ZIP file with per-shelf PNGs.
+    </p>
 
-      if (!fileInput.files.length) {
-        alert("Please choose a shelf image.");
-        return;
-      }
+    <!-- GET form: result opens in a new tab as PNG or ZIP -->
+    <form id="search-visual-form" method="get" action="/api/search-visual-by-available" target="_blank">
+      <div class="field-group">
+        <div class="field">
+          <label for="sv-modelName">modelName *</label>
+          <input id="sv-modelName" name="modelName" type="text" required />
+        </div>
+        <div class="field">
+          <label for="sv-skuId">skuId (optional)</label>
+          <input id="sv-skuId" name="skuId" type="text" />
+        </div>
+        <div class="field">
+          <label for="sv-tenantId">tenantId (optional)</label>
+          <input id="sv-tenantId" name="tenantId" type="text" />
+        </div>
+        <div class="field">
+          <label for="sv-skuDescription">skuDescription (optional)</label>
+          <input id="sv-skuDescription" name="skuDescription" type="text" />
+        </div>
+        <div class="field">
+          <label for="sv-clientId">clientId (optional)</label>
+          <input id="sv-clientId" name="clientId" type="text" />
+        </div>
+        <div class="field">
+          <label for="sv-categoryId">categoryId (optional)</label>
+          <input id="sv-categoryId" name="categoryId" type="text" />
+        </div>
+        <div class="field">
+          <label for="sv-brandId">brandId (optional)</label>
+          <input id="sv-brandId" name="brandId" type="text" />
+        </div>
 
-      const file = fileInput.files[0];
-      const prompt = promptInput.value || "Bottle";
-      const boxThresh = parseFloat(boxInput.value || "0.3");
+        <div class="field">
+          <label for="sv-match_threshold">match_threshold</label>
+          <input id="sv-match_threshold" name="match_threshold" type="number" step="0.01" value="0.19" />
+        </div>
+        <div class="field">
+          <label for="sv-only_matches">only_matches</label>
+          <select id="sv-only_matches" name="only_matches">
+            <option value="true" >true</option>
+            <option value="false" selected>false</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="sv-as_zip">as_zip</label>
+          <select id="sv-as_zip" name="as_zip">
+            <option value="false" selected>false (combined PNG)</option>
+            <option value="true">true (ZIP)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="sv-max_results_per_shelf">max_results_per_shelf</label>
+          <input id="sv-max_results_per_shelf" name="max_results_per_shelf" type="number" value="50" />
+        </div>
+        <div class="field">
+          <label for="sv-nms_iou_threshold">nms_iou_threshold</label>
+          <input id="sv-nms_iou_threshold" name="nms_iou_threshold" type="number" step="0.05" value="0.5" />
+        </div>
+      </div>
+      <button type="submit">Search &amp; Open Result</button>
+    </form>
 
-      const formData = new FormData();
-      formData.append("file", file);
+    <p class="note">
+      This uses a plain GET form so the result opens directly in a new tab as an image or ZIP.  
+      If you want to render the returned PNG in-page, you can switch to JavaScript <code>fetch</code> and handle the blob.
+    </p>
 
-      const url = `/api/index-shelf?prompt=${encodeURIComponent(prompt)}&box_thresh=${encodeURIComponent(boxThresh)}`;
+  </section>
 
-      resultDiv.textContent = "Indexing shelf...";
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          body: formData,
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.detail || `Error: ${res.status}`);
-        }
-        const data = await res.json();
-        lastShelfId = data.image_id;
-        resultDiv.textContent = `Indexed shelf.\nShelf ID: ${data.image_id}\nDetections: ${data.num_detections}\nIndexed objects: ${data.num_indexed}`;
-      } catch (err) {
-        console.error(err);
-        resultDiv.textContent = `Failed to index shelf: ${err.message}`;
-      }
+</main>
+
+<script>
+  async function checkHealth() {
+    const resultEl = document.getElementById('health-result');
+    resultEl.textContent = 'Loading...';
+    try {
+      const res = await fetch('/api/health');
+      const data = await res.json();
+      resultEl.textContent = JSON.stringify(data, null, 2);
+    } catch (err) {
+      resultEl.textContent = 'Error: ' + err;
+    }
+  }
+
+  // /api/index-shelf-yolo form
+  document.getElementById('index-shelf-form').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    const resultEl = document.getElementById('index-shelf-result');
+    resultEl.textContent = 'Uploading...';
+
+    const formData = new FormData();
+    const file = document.getElementById('index-shelf-file').files[0];
+    const thresh = document.getElementById('index-shelf-thresh').value || '0.2';
+
+    if (!file) {
+      resultEl.textContent = 'Please select an image file.';
+      return;
     }
 
-    async function refreshShelves() {
-      const listDiv = document.getElementById("shelves-list");
-      listDiv.textContent = "Loading shelves...";
-      try {
-        const res = await fetch("/api/shelves");
-        if (!res.ok) {
-          throw new Error(`Error: ${res.status}`);
-        }
-        const data = await res.json();
-        if (!data.length) {
-          listDiv.textContent = "No shelves indexed yet.";
-          return;
-        }
-        const lines = data.map(s => `shelf_id=${s.shelf_id} | objects=${s.num_objects}`);
-        listDiv.textContent = lines.join("\n");
-      } catch (err) {
-        console.error(err);
-        listDiv.textContent = `Failed to load shelves: ${err.message}`;
+    formData.append('file', file);
+    formData.append('box_thresh', thresh);
+
+    try {
+      const res = await fetch('/api/index-shelf-yolo', {
+        method: 'POST',
+        body: formData
+      });
+      const data = await res.json();
+      resultEl.textContent = JSON.stringify(data, null, 2);
+    } catch (err) {
+      resultEl.textContent = 'Error: ' + err;
+    }
+  });
+
+  // /api/ModelTraining form
+  document.getElementById('model-training-form').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    const resultEl = document.getElementById('model-training-result');
+    resultEl.textContent = 'Uploading...';
+
+    const formData = new FormData(e.target);
+
+    const imageFile = document.getElementById('mt-image').files[0];
+    if (!imageFile) {
+      resultEl.textContent = 'Please select a query image.';
+      return;
+    }
+    formData.set('image', imageFile);
+
+    try {
+      const res = await fetch('/api/ModelTraining', {
+        method: 'POST',
+        body: formData
+      });
+      const data = await res.json();
+      resultEl.textContent = JSON.stringify(data, null, 2);
+    } catch (err) {
+      resultEl.textContent = 'Error: ' + err;
+    }
+  });
+
+  // /api/AvailableModel form
+  document.getElementById('available-model-form').addEventListener('submit', async function (e) {
+    e.preventDefault();
+    const resultEl = document.getElementById('available-model-result');
+    resultEl.textContent = 'Searching...';
+
+    const params = new URLSearchParams();
+    const fields = [
+      'modelName',
+      'skuId',
+      'tenantId',
+      'skuDescription',
+      'clientId',
+      'categoryId',
+      'brandId'
+    ];
+
+    fields.forEach(idSuffix => {
+      const el = document.getElementById('am-' + idSuffix);
+      if (el && el.value.trim() !== '') {
+        params.append(idSuffix, el.value.trim());
       }
+    });
+
+    if (!params.get('modelName')) {
+      resultEl.textContent = 'modelName is required.';
+      return;
     }
 
-    function getShelfIdOrLast() {
-      const shelfInput = document.getElementById("shelf-id-input");
-      const val = shelfInput.value.trim();
-      if (val) return val;
-      return lastShelfId;
+    try {
+      const res = await fetch('/api/AvailableModel?' + params.toString());
+      const data = await res.json();
+      resultEl.textContent = JSON.stringify(data, null, 2);
+    } catch (err) {
+      resultEl.textContent = 'Error: ' + err;
     }
-
-    async function searchJson() {
-      const fileInput = document.getElementById("query-file");
-      const maxResultsInput = document.getElementById("max-results");
-      const thresholdInput = document.getElementById("match-threshold");
-      const resultPre = document.getElementById("search-json-result");
-      const img = document.getElementById("result-image");
-      img.src = ""; // clear previous image
-
-      if (!fileInput.files.length) {
-        alert("Please choose a query image.");
-        return;
-      }
-
-      const shelfId = getShelfIdOrLast();
-      if (!shelfId) {
-        alert("No shelf_id provided and no last shelf indexed.");
-        return;
-      }
-
-      const file = fileInput.files[0];
-      const maxResults = parseInt(maxResultsInput.value || "10", 10);
-      const matchThreshold = parseFloat(thresholdInput.value || "0.19");
-
-      const formData = new FormData();
-      formData.append("file", file);
-
-      const url = `/api/search?shelf_id=${encodeURIComponent(shelfId)}&max_results=${encodeURIComponent(maxResults)}&match_threshold=${encodeURIComponent(matchThreshold)}`;
-
-      resultPre.textContent = "Searching...";
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          body: formData,
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.detail || `Error: ${res.status}`);
-        }
-        const data = await res.json();
-        resultPre.textContent = JSON.stringify(data, null, 2);
-      } catch (err) {
-        console.error(err);
-        resultPre.textContent = `Failed to search: ${err.message}`;
-      }
-    }
-
-    async function searchVisual() {
-      const fileInput = document.getElementById("query-file");
-      const maxResultsInput = document.getElementById("max-results");
-      const thresholdInput = document.getElementById("match-threshold");
-      const resultPre = document.getElementById("search-json-result");
-      const img = document.getElementById("result-image");
-
-      if (!fileInput.files.length) {
-        alert("Please choose a query image.");
-        return;
-      }
-
-      const shelfId = getShelfIdOrLast();
-      if (!shelfId) {
-        alert("No shelf_id provided and no last shelf indexed.");
-        return;
-      }
-
-      const file = fileInput.files[0];
-      const maxResults = parseInt(maxResultsInput.value || "10", 10);
-      const matchThreshold = parseFloat(thresholdInput.value || "0.19");
-
-      const formData = new FormData();
-      formData.append("file", file);
-
-      const url = `/api/search-visual?shelf_id=${encodeURIComponent(shelfId)}&max_results=${encodeURIComponent(maxResults)}&match_threshold=${encodeURIComponent(matchThreshold)}`;
-
-      resultPre.textContent = "Searching (visual)...";
-      img.src = "";
-
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          body: formData,
-        });
-        if (!res.ok) {
-          const errText = await res.text();
-          throw new Error(errText || `Error: ${res.status}`);
-        }
-        const blob = await res.blob();
-        const objectUrl = URL.createObjectURL(blob);
-        img.src = objectUrl;
-        resultPre.textContent = `Visual result for shelf_id=${shelfId}`;
-      } catch (err) {
-        console.error(err);
-        resultPre.textContent = `Failed to search (visual): ${err.message}`;
-      }
-    }
-
-    document.getElementById("index-shelf-btn").addEventListener("click", indexShelf);
-    document.getElementById("refresh-shelves-btn").addEventListener("click", refreshShelves);
-    document.getElementById("search-json-btn").addEventListener("click", searchJson);
-    document.getElementById("search-visual-btn").addEventListener("click", searchVisual);
-
-    // Load shelves on startup
-    refreshShelves();
-  </script>
+  });
+</script>
 </body>
 </html>

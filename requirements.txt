@@ -20,3 +20,5 @@ pymilvus
 
 supervision
 ultralytics
+hf_transfer
+pycloudflared
