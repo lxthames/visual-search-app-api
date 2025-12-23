@@ -117,8 +117,9 @@ class DataStore:
             secure=False,
         )
 
-        # CLIP ViT-B/32 typically => 512-dim; keep as a code-level constant
-        dim = 512
+        # ✅ UPGRADED: DINOv2-Large uses 1024-dimensional embeddings
+        # Changed from 768 (DINOv2-base) to 1024 (DINOv2-large)
+        dim = 1024
 
         # Create or get collection
         if not utility.has_collection(collection_name):
@@ -230,10 +231,14 @@ class DataStore:
             )
 
         # 2. Prepare metadata record
+        # FIX: Check if shape_label is in metadata
+        shape_val = metadata.get("shape_label", "unknown")
+
         record = {
             "_id": crop_id,
             "parent_image_id": image_id,
             "label": str(metadata.get("label", "")),
+            "shape_label": shape_val,  # <--- NEW: SAVING THE LABEL
             "confidence": metadata.get("confidence"),
             "bbox": metadata.get("bbox"),
             "timestamp": datetime.now().isoformat(),
@@ -255,7 +260,7 @@ class DataStore:
     ) -> None:
         """
         Batch save multiple objects to database. Much faster than individual saves.
-        objects: List of dicts with keys: crop_id, vector, metadata
+        objects: List of dicts with keys: crop_id, vector, metadata, shape_label
         """
         if not objects:
             return
@@ -288,10 +293,15 @@ class DataStore:
         # 2. Prepare metadata records
         records = []
         for obj in objects:
+            # FIX: Get shape_label from the root object (where routes.py put it)
+            # fallback to metadata if not found
+            shape_val = obj.get("shape_label") or obj["metadata"].get("shape_label") or "unknown"
+            
             record = {
                 "_id": obj["crop_id"],
                 "parent_image_id": image_id,
                 "label": str(obj["metadata"].get("label", "")),
+                "shape_label": shape_val, # <--- NEW: SAVING THE LABEL
                 "confidence": obj["metadata"].get("confidence"),
                 "bbox": obj["metadata"].get("bbox"),
                 "timestamp": datetime.now().isoformat(),
@@ -342,19 +352,29 @@ class DataStore:
 
         found_objects: List[Dict[str, Any]] = []
 
-        for i, crop_id in enumerate(crop_ids):
-            score = distances[i]
-
-            meta_data: Optional[Dict[str, Any]] = None
-            if self.use_mongo and self.mongo_coll is not None:
-                meta_data = self.mongo_coll.find_one({"_id": crop_id})
-            else:
-                meta_data = next(
-                    (item for item in self.local_meta if item["_id"] == crop_id), None
-                )
-
-            if meta_data:
-                found_objects.append({"score": score, "data": meta_data})
+        # PERFORMANCE FIX: Batch fetch metadata instead of N+1 queries
+        if self.use_mongo and self.mongo_coll is not None:
+            # Batch fetch all metadata in a single query
+            if crop_ids:
+                meta_data_dict = {
+                    doc["_id"]: doc
+                    for doc in self.mongo_coll.find({"_id": {"$in": crop_ids}})
+                }
+                
+                for i, crop_id in enumerate(crop_ids):
+                    score = distances[i]
+                    meta_data = meta_data_dict.get(crop_id)
+                    if meta_data:
+                        found_objects.append({"score": score, "data": meta_data})
+        else:
+            # For local JSON, create a lookup dict for O(1) access
+            meta_data_dict = {item["_id"]: item for item in self.local_meta if item["_id"] in crop_ids}
+            
+            for i, crop_id in enumerate(crop_ids):
+                score = distances[i]
+                meta_data = meta_data_dict.get(crop_id)
+                if meta_data:
+                    found_objects.append({"score": score, "data": meta_data})
 
         return found_objects
 

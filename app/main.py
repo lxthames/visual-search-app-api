@@ -1,10 +1,17 @@
 # app/main.py
+import logging
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse  # ← add this
 
 from .core.config import settings
 from .api.routes import router as api_router
+
+# Configure logging for performance monitoring
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 app = FastAPI(title=settings.PROJECT_NAME)
 

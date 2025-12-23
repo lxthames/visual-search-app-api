@@ -205,6 +205,9 @@ class DataStore:
             "label": str(metadata.get("label", "")),
             "confidence": metadata.get("confidence"),
             "bbox": metadata.get("bbox"),
+            # --- NEW: SAVE SHAPE LABEL ---
+            "shape_label": metadata.get("shape_label"),
+            # -----------------------------
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -263,6 +266,14 @@ class DataStore:
                 "label": str(obj["metadata"].get("label", "")),
                 "confidence": obj["metadata"].get("confidence"),
                 "bbox": obj["metadata"].get("bbox"),
+                # --- NEW: SAVE SHAPE LABEL IN BATCH ---
+                "metadata": {  # Nesting it inside metadata is safer for MongoDB expansion, or flatten it.
+                    # Flattening is usually better for querying:
+                    "shape_label": obj["metadata"].get("shape_label"),
+                },
+                # Let's flatten it to be consistent with save_object above
+                "shape_label": obj["metadata"].get("shape_label"),
+                # --------------------------------------
                 "timestamp": datetime.now().isoformat(),
             }
             records.append(record)
