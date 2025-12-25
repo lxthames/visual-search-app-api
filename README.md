@@ -1,8 +1,3 @@
-Here’s a small `README.md` you can drop into your repo 👇
-(You can tweak the name, endpoints, and description to match your app exactly.)
-
-
-
 Visual Semantic API
 
 This project is a **backend-only FastAPI application** that exposes a set of API endpoints for interacting with a visual / semantic processing pipeline (e.g. indexing data and running searches).  
