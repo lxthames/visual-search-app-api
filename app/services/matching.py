@@ -3,6 +3,7 @@ Advanced matching features for robust visual search:
 - Color Histogram Analysis
 - Geometric Pattern Recognition
 - Shape Consistency
+- Edge Structure Analysis
 """
 from __future__ import annotations
 
@@ -437,9 +438,10 @@ class ShapeConsistencyChecker:
             Similarity score (0-1)
         """
         # Compute similarity for each feature
-        aspect_sim = 1.0 - abs(features1["aspect_ratio"] - features2["aspect_ratio"]) / max(
-            features1["aspect_ratio"], features2["aspect_ratio"], 1.0
-        )
+        # Ensure aspect ratios are positive to avoid division issues
+        ar1 = max(0.001, features1.get("aspect_ratio", 1.0))
+        ar2 = max(0.001, features2.get("aspect_ratio", 1.0))
+        aspect_sim = 1.0 - abs(ar1 - ar2) / max(ar1, ar2, 1.0)
         
         compact_sim = 1.0 - abs(features1["compactness"] - features2["compactness"])
         rect_sim = 1.0 - abs(features1["rectangularity"] - features2["rectangularity"])
@@ -478,10 +480,128 @@ class ShapeConsistencyChecker:
             return 0.0
 
 
+class EdgeStructureAnalyzer:
+    """Extract edge-based structural embeddings for robust matching."""
+    
+    def __init__(self):
+        """
+        Initialize edge structure analyzer.
+        """
+        # Canny edge detection parameters
+        self.canny_low = 50
+        self.canny_high = 150
+        
+        # Histogram bins
+        self.orientation_bins = 8  # 8 directions (0°, 45°, 90°, etc.)
+        self.spatial_bins = 4      # 4x4 spatial grid
+    
+    def extract_edge_embedding(self, image: np.ndarray) -> np.ndarray:
+        """
+        Extract edge-based structural embedding.
+        
+        Args:
+            image: RGB image array (H, W, 3)
+            
+        Returns:
+            Normalized embedding vector (orientation_bins * spatial_bins^2 = 128-dim)
+        """
+        # Resize to fixed size for consistency (if needed)
+        target_size = 224
+        if image.shape[0] != target_size or image.shape[1] != target_size:
+            image = cv2.resize(image, (target_size, target_size), interpolation=cv2.INTER_AREA)
+        
+        # 1. Convert to grayscale
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image
+        
+        # Apply Gaussian blur to reduce noise
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # 2. Apply Canny edge detection
+        edges = cv2.Canny(gray, self.canny_low, self.canny_high)
+        
+        # 3. Compute edge orientation using Sobel operators
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        
+        # Compute orientations (in degrees)
+        orientations = np.arctan2(sobel_y, sobel_x) * 180 / np.pi
+        orientations = (orientations + 360) % 360  # Normalize to 0-360
+        
+        # 4. Spatial binning + orientation histogram
+        h, w = edges.shape
+        bin_h, bin_w = h // self.spatial_bins, w // self.spatial_bins
+        
+        embedding = []
+        for i in range(self.spatial_bins):
+            for j in range(self.spatial_bins):
+                y1, y2 = i * bin_h, (i + 1) * bin_h if i < self.spatial_bins - 1 else h
+                x1, x2 = j * bin_w, (j + 1) * bin_w if j < self.spatial_bins - 1 else w
+                
+                # Get edges in this spatial bin
+                bin_edges = edges[y1:y2, x1:x2]
+                bin_orientations = orientations[y1:y2, x1:x2]
+                
+                # Only consider pixels that are edges
+                edge_mask = bin_edges > 0
+                if edge_mask.sum() > 0:
+                    bin_orientations = bin_orientations[edge_mask]
+                    # Histogram of orientations (8 bins: 0-45°, 45-90°, etc.)
+                    hist, _ = np.histogram(
+                        bin_orientations, 
+                        bins=self.orientation_bins, 
+                        range=(0, 360)
+                    )
+                else:
+                    hist = np.zeros(self.orientation_bins)
+                
+                # Normalize by number of edge pixels (or total pixels if no edges)
+                norm_factor = edge_mask.sum() if edge_mask.sum() > 0 else bin_edges.size
+                hist = hist / (norm_factor + 1e-10)
+                embedding.extend(hist)
+        
+        embedding = np.array(embedding)
+        # L2 normalize
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+        
+        return embedding
+    
+    def get_edge_similarity(
+        self, 
+        img1: np.ndarray, 
+        img2: np.ndarray
+    ) -> float:
+        """
+        Compute edge structure similarity between two images.
+        
+        Args:
+            img1: First RGB image
+            img2: Second RGB image
+            
+        Returns:
+            Similarity score (0-1, higher is more similar)
+        """
+        try:
+            emb1 = self.extract_edge_embedding(img1)
+            emb2 = self.extract_edge_embedding(img2)
+            
+            # Cosine similarity
+            similarity = np.dot(emb1, emb2)
+            return max(0.0, min(1.0, similarity))  # Clamp to [0, 1]
+        except Exception as e:
+            logger.warning(f"Edge similarity calculation failed: {e}")
+            return 0.0
+
+
 # Singleton instances
 _color_analyzer: Optional[ColorHistogramAnalyzer] = None
 _geometric_recognizer: Optional[GeometricPatternRecognizer] = None
 _shape_checker: Optional[ShapeConsistencyChecker] = None
+_edge_analyzer: Optional[EdgeStructureAnalyzer] = None
 
 
 def get_color_analyzer() -> ColorHistogramAnalyzer:
@@ -506,4 +626,12 @@ def get_shape_checker() -> ShapeConsistencyChecker:
     if _shape_checker is None:
         _shape_checker = ShapeConsistencyChecker()
     return _shape_checker
+
+
+def get_edge_analyzer() -> EdgeStructureAnalyzer:
+    """Get singleton edge structure analyzer."""
+    global _edge_analyzer
+    if _edge_analyzer is None:
+        _edge_analyzer = EdgeStructureAnalyzer()
+    return _edge_analyzer
 

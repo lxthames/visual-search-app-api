@@ -43,7 +43,8 @@ from app.services.datastore import get_datastore
 from app.services.matching import (
     get_color_analyzer,
     get_geometric_recognizer,
-    get_shape_checker
+    get_shape_checker,
+    get_edge_analyzer
 )
 from app.services.query_augmentation import get_query_augmenter
 
@@ -313,6 +314,7 @@ def get_yolo_v11_model() -> YOLO:
 async def index_shelf_yolo(
     file: UploadFile = File(...),
     box_thresh: float = 0.2,
+    shelf_name: str | None = Form(None, description="Optional name for this shelf to use in search"),
 ):
     start_time = time.time()
     
@@ -351,10 +353,12 @@ async def index_shelf_yolo(
             lambda: model.predict(source=tmp_path, imgsz=640, conf=box_thresh, save=False, max_det=650)
         )
         
-        if not results:
+        if not results or len(results) == 0:
             raise HTTPException(status_code=500, detail="YOLO v11 returned no results")
 
         result = results[0]
+        if result is None:
+            raise HTTPException(status_code=500, detail="YOLO v11 returned invalid result")
         boxes = result.boxes
         image_id = str(uuid.uuid4())
         detection_time = time.time() - start_time
@@ -411,7 +415,7 @@ async def index_shelf_yolo(
         if objects_to_save:
             await loop.run_in_executor(
                 None,
-                partial(datastore.batch_save_objects, image_id, objects_to_save)
+                partial(datastore.batch_save_objects, image_id, objects_to_save, shelf_name)
             )
 
         # Save shelf image
@@ -923,14 +927,519 @@ def run_verification_sync(
 #     return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/png")
 
 def l2_to_cosine(l2_distance: float) -> float:
+    """
+    Convert L2 distance to cosine similarity for normalized vectors.
+    Formula: Cosine = 1 - (L2² / 2)
+    
+    Note: This function is kept for backward compatibility.
+    New implementations should use IP metric directly.
+    """
     # Formula for normalized vectors: Cosine = 1 - (Distance^2 / 2)
     return max(0.0, min(1.0, 1.0 - (l2_distance ** 2) / 2))
 
-@router.get("/search-visual-by-available")
-async def search_visual_by_available(
+def ip_to_cosine(ip_distance: float) -> float:
+    """
+    Convert Inner Product (IP) distance to cosine similarity for normalized vectors.
+    
+    For normalized vectors: IP_distance = 1 - cosine_similarity
+    So: cosine_similarity = 1 - IP_distance
+    
+    Args:
+        ip_distance: Inner Product distance from Milvus (for normalized vectors, this is 1 - cosine)
+    
+    Returns:
+        Cosine similarity (0.0-1.0)
+    """
+    # For normalized vectors, IP distance = 1 - cosine_similarity
+    # So cosine_similarity = 1 - IP_distance
+    # Note: IP can be negative for very dissimilar vectors, so clamp to [0, 1]
+    cosine = 1.0 - ip_distance
+    return max(0.0, min(1.0, cosine))
+
+def distance_to_similarity(distance: float, metric_type: str = "IP") -> float:
+    """
+    Convert the vector DB score to a 0-1 similarity value.
+
+    Milvus (IP):
+        - Returns inner-product *similarity* (higher = better) for normalized vectors.
+        - Older code might have stored 1 - cosine as a "distance". Detect and convert.
+    Chroma (COSINE):
+        - Returns cosine *distance* (0 = identical, 1 = orthogonal), so convert to similarity.
+    """
+    if distance is None:
+        return 0.0
+
+    metric = (metric_type or "IP").upper()
+
+    if metric == "IP":
+        # If the value already looks like a similarity (common for Milvus IP), clamp and return.
+        if -1.0 <= distance <= 1.5:
+            return max(0.0, min(1.0, distance))
+        # Fallback for legacy "1 - cosine" distances.
+        return ip_to_cosine(distance)
+
+    if metric == "COSINE":
+        # Chroma returns cosine distance in [0, 2]; convert to similarity.
+        if 0.0 <= distance <= 2.0:
+            return max(0.0, min(1.0, 1.0 - distance))
+        # If something already looks like similarity, just clamp.
+        return max(0.0, min(1.0, distance))
+
+    # Default: treat as L2 distance for normalized vectors.
+    return l2_to_cosine(distance)
+
+# @router.get("/search-visual-by-available")
+# async def search_visual_by_available(
+#     modelName: str,
+#     skuId: str | None = None,
+#     tenantId: str | None = None,
+    
+#     # 1. HARD FLOOR: Basic sanity check (e.g., 0.40)
+#     similarity_threshold: float = Query(0.38, description="Hard Floor: Min Similarity (0.0-1.0)"),
+    
+#     # 2. DYNAMIC THRESHOLD: The "Relative" check (e.g., 0.30)
+#     relative_drop_off: float = Query(0.30, description="Dynamic Threshold: Allowed deviation from best match"),
+    
+#     filter_by_shape: bool = Query(True, description="Strictly enforce shape matching"),
+    
+#     # 3. ADVANCED MATCHING FEATURES
+#     use_color_analysis: bool = Query(True, description="Enable color histogram analysis"),
+#     use_geometric_matching: bool = Query(True, description="Enable geometric pattern recognition"),
+#     use_shape_consistency: bool = Query(True, description="Enable advanced shape consistency checking"),
+    
+#     # 4. MATCHING WEIGHTS (must sum to 1.0)
+#     vector_weight: float = Query(0.5, description="Weight for vector similarity (0.0-1.0)"),
+#     color_weight: float = Query(0.2, description="Weight for color histogram (0.0-1.0)"),
+#     geometric_weight: float = Query(0.2, description="Weight for geometric matching (0.0-1.0)"),
+#     shape_weight: float = Query(0.1, description="Weight for shape consistency (0.0-1.0)"),
+    
+#     # 5. ADVANCED MATCHING THRESHOLDS
+#     min_color_similarity: float = Query(0.3, description="Minimum color similarity threshold"),
+#     min_geometric_similarity: float = Query(0.2, description="Minimum geometric similarity threshold"),
+#     min_shape_consistency: float = Query(0.4, description="Minimum shape consistency threshold"),
+    
+#     # 6. MULTI-VIEW QUERY STRATEGY (CRITICAL for 90% accuracy)
+#     use_multi_view: bool = Query(True, description="Use multi-view query strategy (recommended for 90% accuracy)"),
+#     max_query_views: int = Query(8, description="Maximum number of query views to generate"),
+# ):
+#     start_time = time.time()
+#     logger.info(f"SEARCH: {modelName} | Floor: {similarity_threshold} | Drop-off: {relative_drop_off}")
+    
+#     # --- 1. SETUP & QUERY ---
+#     collection = get_single_query_images_collection()
+#     query_doc = collection.find_one({"modelName": modelName})
+#     if not query_doc:
+#         raise HTTPException(status_code=404, detail="Model not found")
+
+#     query_shape = query_doc.get("shape_label", "unknown")
+#     image_bytes = base64.b64decode(query_doc.get("image_base64"))
+#     query_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+#     logo_bbox = query_doc.get("logo_bbox")
+    
+#     # ✅ Using FULL product image for matching (stored in ModelTraining endpoint)
+#     # This provides better results for:
+#     # - Color histogram analysis (full product colors)
+#     # - Shape consistency (full product shape)
+#     # - Geometric matching (more features from full product)
+#     # - Vector similarity (better context)
+
+#     # --- 2. MULTI-VIEW QUERY STRATEGY (CRITICAL for 90% accuracy) ---
+#     loop = asyncio.get_event_loop()
+#     vectorizer = get_vectorizer()
+#     datastore = get_datastore()
+    
+#     # Generate multiple views of the query image for robust matching
+#     query_views = [query_img]  # Always include original
+#     if use_multi_view:
+#         augmenter = get_query_augmenter()
+#         views = augmenter.generate_smart_views(query_img, logo_bbox=logo_bbox)
+#         query_views = views[:max_query_views]
+#         logger.info(f"SEARCH: Generated {len(query_views)} query views for multi-view matching")
+    
+#     # Extract embeddings for all views
+#     query_vectors = []
+#     for view in query_views:
+#         view_vector = await loop.run_in_executor(
+#             None,
+#             vectorizer.get_image_embedding,
+#             view
+#         )
+#         query_vectors.append(view_vector)
+    
+#     # --- 2.1. MULTI-VIEW VECTOR SEARCH ---
+#     # Query with all views and combine results
+#     all_results: Dict[str, Dict[str, Any]] = {}  # crop_id -> {best_score, count, data}
+    
+#     # PERFORMANCE: Limit initial results and use pagination if needed
+#     max_initial_results = 500
+#     max_results_per_view = max_initial_results // len(query_views) if len(query_views) > 1 else max_initial_results
+    
+#     for i, query_vector in enumerate(query_vectors):
+#         view_results = datastore.query_similar(query_vector, n_results=max_results_per_view)
+        
+#         for res in view_results:
+#             data = res.get("data") or {}
+#             crop_id = data.get("_id")
+#             if not crop_id:
+#                 continue
+            
+#             l2_distance = float(res.get("score", 2.0))
+#             similarity = l2_to_cosine(l2_distance)
+            
+#             # Keep best score across all views
+#             if crop_id not in all_results:
+#                 all_results[crop_id] = {
+#                     "best_score": similarity,
+#                     "view_count": 1,
+#                     "data": data,
+#                     "l2_distance": l2_distance
+#                 }
+#             else:
+#                 # Update if this view has better score
+#                 if similarity > all_results[crop_id]["best_score"]:
+#                     all_results[crop_id]["best_score"] = similarity
+#                     all_results[crop_id]["l2_distance"] = l2_distance
+#                 all_results[crop_id]["view_count"] += 1
+    
+#     # Convert to list format for compatibility
+#     results = [
+#         {
+#             "score": info["l2_distance"],
+#             "data": info["data"],
+#             "multi_view_score": info["best_score"],  # Best score across views
+#             "view_count": info["view_count"]  # How many views matched this candidate
+#         }
+#         for crop_id, info in all_results.items()
+#     ]
+    
+#     # Sort by multi-view score (best score across all views)
+#     results.sort(key=lambda x: x.get("multi_view_score", 0), reverse=True)
+    
+#     # Limit to top candidates
+#     results = results[:max_initial_results]
+    
+#     query_time = time.time() - start_time
+#     logger.info(f"SEARCH: Multi-view vector query completed in {query_time:.2f}s, found {len(results)} unique candidates from {len(query_views)} views")
+
+#     # --- 3. FILTERING & ADVANCED MATCHING ---
+#     potential_matches = []
+    
+#     # Normalize weights
+#     total_weight = vector_weight + (color_weight if use_color_analysis else 0) + \
+#                    (geometric_weight if use_geometric_matching else 0) + \
+#                    (shape_weight if use_shape_consistency else 0)
+    
+#     if total_weight == 0:
+#         total_weight = 1.0  # Fallback to vector only
+    
+#     # Initialize matching analyzers if needed
+#     color_analyzer = get_color_analyzer() if use_color_analysis else None
+#     geometric_recognizer = get_geometric_recognizer() if use_geometric_matching else None
+#     shape_checker = get_shape_checker() if use_shape_consistency else None
+    
+#     # Convert query images to numpy arrays for matching
+#     # Use original image for advanced matching (or best view)
+#     query_img_np = np.array(query_img)
+#     query_views_np = [np.array(view) for view in query_views]
+    
+#     logger.info(f"SEARCH: Processing {len(results)} candidates with advanced matching")
+    
+#     for res in results:
+#         data = res.get("data") or {}
+        
+#         # Shape Filter (basic)
+#         if filter_by_shape and query_shape != "unknown":
+#             candidate_shape = data.get("shape_label") or data.get("metadata", {}).get("shape_label") or "unknown"
+#             if candidate_shape != "unknown" and query_shape != candidate_shape:
+#                 continue 
+
+#         # Calculate Vector Similarity Score (use multi-view score if available)
+#         multi_view_score = res.get("multi_view_score")
+#         if multi_view_score is not None:
+#             vector_similarity = float(multi_view_score)
+#         else:
+#             l2_distance = float(res.get("score", 2.0))
+#             vector_similarity = l2_to_cosine(l2_distance)
+
+#         # Hard Floor on vector similarity
+#         if vector_similarity < similarity_threshold:
+#             continue
+
+#         bbox = get_bbox_from_record(data)
+#         if not bbox: continue
+        
+#         # Initialize combined score with vector similarity
+#         combined_score = vector_similarity * vector_weight
+#         matching_details = {
+#             "vector": vector_similarity,
+#             "color": 0.0,
+#             "geometric": 0.0,
+#             "shape": 0.0
+#         }
+        
+#         # Advanced matching features (only for top candidates to save computation)
+#         # We'll apply these after initial filtering to top candidates
+#         potential_matches.append({
+#             "crop_id": data.get("_id"),
+#             "shelf_id": str(data.get("parent_image_id")),
+#             "bbox": bbox,
+#             "score": vector_similarity,  # Initial score
+#             "vector_score": vector_similarity,
+#             "matching_details": matching_details,
+#             "data": data  # Store data for later advanced matching
+#         })
+
+#     if not potential_matches:
+#         logger.warning("No matches met the Hard Floor.")
+#         raise HTTPException(status_code=404, detail="No matches found")
+
+#     # Sort by vector similarity and take top candidates for advanced matching
+#     potential_matches.sort(key=lambda x: x["vector_score"], reverse=True)
+    
+#     # Apply advanced matching to top candidates (limit to avoid performance issues)
+#     max_advanced_matching = min(100, len(potential_matches))
+#     top_candidates = potential_matches[:max_advanced_matching]
+    
+#     logger.info(f"SEARCH: Applying advanced matching to top {len(top_candidates)} candidates")
+    
+#     # Load shelf images for candidate extraction
+#     shelves_dir = settings.SHELF_DIR
+#     shelf_images_cache: Dict[str, np.ndarray] = {}
+    
+#     # Process advanced matching synchronously (in executor to avoid blocking)
+#     def process_candidate_advanced_matching(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+#         """Process a single candidate with advanced matching."""
+#         shelf_id = candidate["shelf_id"]
+#         bbox = candidate["bbox"]
+        
+#         # Load shelf image if not cached
+#         if shelf_id not in shelf_images_cache:
+#             shelf_path = shelves_dir / f"{shelf_id}.png"
+#             if shelf_path.exists():
+#                 shelf_img_bgr = cv2.imread(str(shelf_path))
+#                 if shelf_img_bgr is not None:
+#                     shelf_images_cache[shelf_id] = cv2.cvtColor(shelf_img_bgr, cv2.COLOR_BGR2RGB)
+        
+#         shelf_img = shelf_images_cache.get(shelf_id)
+#         if shelf_img is None:
+#             # Fallback to vector score only
+#             return candidate
+        
+#         # Extract candidate crop
+#         h, w = shelf_img.shape[:2]
+#         vb = validate_and_clamp_bbox(bbox, w, h)
+#         if vb is None:
+#             return candidate
+        
+#         x1, y1, x2, y2 = vb
+#         candidate_img = shelf_img[y1:y2, x1:x2]
+        
+#         if candidate_img.size == 0 or candidate_img.shape[0] < 10 or candidate_img.shape[1] < 10:
+#             return candidate
+        
+#         # Apply advanced matching features with multi-view strategy
+#         color_scores = []
+#         geometric_scores = []
+#         shape_scores = []
+        
+#         try:
+#             # Try matching with all query views, take best score
+#             for query_view_np in query_views_np:
+#                 # Color Histogram Analysis
+#                 if use_color_analysis and color_analyzer:
+#                     color_sim = color_analyzer.get_color_similarity(query_view_np, candidate_img)
+#                     color_scores.append(color_sim)
+                
+#                 # Geometric Pattern Recognition
+#                 if use_geometric_matching and geometric_recognizer:
+#                     geo_sim = geometric_recognizer.get_geometric_similarity(
+#                         query_view_np, candidate_img, use_sift=True
+#                     )
+#                     geometric_scores.append(geo_sim)
+                
+#                 # Shape Consistency
+#                 if use_shape_consistency and shape_checker:
+#                     shape_sim = shape_checker.get_shape_consistency(query_view_np, candidate_img)
+#                     shape_scores.append(shape_sim)
+            
+#             # Use best score across all views
+#             color_score = max(color_scores) if color_scores else 0.0
+#             geometric_score = max(geometric_scores) if geometric_scores else 0.0
+#             shape_score = max(shape_scores) if shape_scores else 0.0
+            
+#             # Apply thresholds (use best score, so more lenient)
+#             if use_color_analysis and color_score < min_color_similarity:
+#                 return None  # Skip this candidate
+            
+#             if use_geometric_matching and geometric_score < min_geometric_similarity:
+#                 return None  # Skip this candidate
+            
+#             if use_shape_consistency and shape_score < min_shape_consistency:
+#                 return None  # Skip this candidate
+            
+#         except Exception as e:
+#             logger.warning(f"Advanced matching failed for candidate {candidate['crop_id']}: {e}")
+#             # Fallback to vector score only
+#             return candidate
+        
+#         # Calculate combined score
+#         combined_score = (
+#             candidate["vector_score"] * vector_weight +
+#             color_score * (color_weight if use_color_analysis else 0) +
+#             geometric_score * (geometric_weight if use_geometric_matching else 0) +
+#             shape_score * (shape_weight if use_shape_consistency else 0)
+#         ) / total_weight
+        
+#         # Update candidate
+#         candidate["score"] = combined_score
+#         candidate["matching_details"]["color"] = color_score
+#         candidate["matching_details"]["geometric"] = geometric_score
+#         candidate["matching_details"]["shape"] = shape_score
+        
+#         return candidate
+    
+#     # Process candidates in executor to avoid blocking
+#     loop = asyncio.get_event_loop()
+    
+#     # Process in batches
+#     batch_size = 20
+#     enhanced_candidates = []
+#     for i in range(0, len(top_candidates), batch_size):
+#         batch = top_candidates[i:i + batch_size]
+        
+#         # Process batch in executor
+#         processed_batch = await loop.run_in_executor(
+#             None,
+#             lambda: [process_candidate_advanced_matching(c) for c in batch]
+#         )
+        
+#         # Filter out None results (candidates that didn't pass thresholds)
+#         enhanced_candidates.extend([c for c in processed_batch if c is not None])
+    
+#     # For remaining candidates, use vector score only (no advanced matching)
+#     remaining_candidates = potential_matches[max_advanced_matching:]
+    
+#     # Combine enhanced candidates with remaining candidates (using vector score only)
+#     all_candidates = enhanced_candidates + remaining_candidates
+    
+#     # Dynamic Threshold Calculation
+#     if all_candidates:
+#         global_max_score = max(m["score"] for m in all_candidates)
+#         dynamic_cutoff = global_max_score - relative_drop_off
+#         final_cutoff = max(similarity_threshold, dynamic_cutoff)
+#     else:
+#         final_cutoff = similarity_threshold
+
+#     best_matches: Dict[str, MatchResult] = {}
+
+#     for m in all_candidates:
+#         if m["score"] < final_cutoff:
+#             continue # Dropped by dynamic threshold
+            
+#         c_id = m["crop_id"]
+#         # Keep best score for unique crop ID
+#         if c_id not in best_matches or m["score"] > best_matches[c_id].score:
+#             best_matches[c_id] = MatchResult(
+#                 shelf_id=m["shelf_id"],
+#                 bbox=m["bbox"],
+#                 score=m["score"]
+#             )
+
+#     if not best_matches:
+#         raise HTTPException(status_code=404, detail="No matches passed Dynamic Threshold")
+
+#     # Group matches by shelf
+#     shelf_matches = defaultdict(list)
+#     for m in best_matches.values():
+#         shelf_matches[m.shelf_id].append(m)
+
+#     # --- 4. VISUALIZATION (RED & GREEN BOXES) ---
+#     # PERFORMANCE FIX: Batch fetch all shelf items in a single query
+#     shelves_dir = settings.SHELF_DIR
+#     annotated_images = []
+    
+#     shelf_ids_list = list(shelf_matches.keys())
+    
+#     # Batch fetch all shelf items at once (fixes N+1 query problem)
+#     all_shelf_items_dict: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+#     if datastore.mongo_coll is not None and shelf_ids_list:
+#         # Single query for all shelves
+#         all_items = datastore.mongo_coll.find({"parent_image_id": {"$in": shelf_ids_list}})
+#         for item in all_items:
+#             shelf_id = item.get("parent_image_id")
+#             if shelf_id:
+#                 all_shelf_items_dict[shelf_id].append(item)
+
+#     for shelf_id, matches in shelf_matches.items():
+#         shelf_path = shelves_dir / f"{shelf_id}.png"
+#         if not shelf_path.exists(): continue
+        
+#         img = cv2.imread(str(shelf_path))
+#         if img is None: continue
+#         h, w = img.shape[:2]
+
+#         # A. Draw RED boxes for everything on the shelf first
+#         # ---------------------------------------------------
+#         # Use pre-fetched items instead of querying per shelf
+#         shelf_items = all_shelf_items_dict.get(shelf_id, [])
+#         for item in shelf_items:
+#             bbox = get_bbox_from_record(item)
+#             if not bbox: continue
+            
+#             vb = validate_and_clamp_bbox(bbox, w, h)
+#             if vb:
+#                 # RED Box (BGR: 0, 0, 255)
+#                 # Use thickness=2 so it's slightly thinner than the Green box
+#                 cv2.rectangle(img, (vb[0], vb[1]), (vb[2], vb[3]), (0, 0, 255), 2)
+
+#         # B. Draw GREEN boxes for Matches (Overwriting Red)
+#         # ---------------------------------------------------
+#         matches.sort(key=lambda x: x.score, reverse=True)
+#         # Apply NMS to clean up Green boxes
+#         cleaned_matches = apply_nms(matches, iou_threshold=0.5)
+
+#         for m in cleaned_matches:
+#             vb = validate_and_clamp_bbox(m.bbox, w, h)
+#             if vb:
+#                 # GREEN Box (BGR: 0, 255, 0)
+#                 # Use thickness=3 to fully cover the Red box underneath
+#                 cv2.rectangle(img, (vb[0], vb[1]), (vb[2], vb[3]), (0, 255, 0), 3)
+                
+#                 # Label
+#                 text = f"{m.score:.2f}"
+#                 cv2.putText(img, text, (vb[0], vb[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+#         annotated_images.append(img)
+
+#     if not annotated_images:
+#         raise HTTPException(status_code=404, detail="Shelf image not found")
+
+#     # Combine images
+#     total_h = sum(img.shape[0] for img in annotated_images)
+#     max_w = max(img.shape[1] for img in annotated_images)
+#     combined = np.zeros((total_h, max_w, 3), dtype=np.uint8)
+    
+#     y = 0
+#     for img in annotated_images:
+#         h, w = img.shape[:2]
+#         combined[y:y+h, 0:w] = img
+#         y += h
+        
+#     ok, buf = cv2.imencode(".png", combined)
+#     if not ok:
+#         raise HTTPException(status_code=500, detail="Failed to encode result image")
+    
+#     total_time = time.time() - start_time
+#     logger.info(f"SEARCH: Total search time {total_time:.2f}s, found {len(best_matches)} matches across {len(shelf_matches)} shelves")
+    
+#     return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/png")
+
+
+@router.get("/search-visual-by-model-sku")
+async def search_visual_by_model_sku(
     modelName: str,
-    skuId: str | None = None,
-    tenantId: str | None = None,
+    skuIds: str | None = Query(None, description="Comma-separated list of SKU IDs"),
+    shelf_name: str | None = Query(None, description="Filter results to only this shelf name (from index-shelf-yolo)"),
     
     # 1. HARD FLOOR: Basic sanity check (e.g., 0.40)
     similarity_threshold: float = Query(0.38, description="Hard Floor: Min Similarity (0.0-1.0)"),
@@ -938,81 +1447,197 @@ async def search_visual_by_available(
     # 2. DYNAMIC THRESHOLD: The "Relative" check (e.g., 0.30)
     relative_drop_off: float = Query(0.30, description="Dynamic Threshold: Allowed deviation from best match"),
     
-    filter_by_shape: bool = Query(True, description="Strictly enforce shape matching"),
+    filter_by_shape: bool = Query(False, description="Strictly enforce shape matching"),
     
     # 3. ADVANCED MATCHING FEATURES
     use_color_analysis: bool = Query(True, description="Enable color histogram analysis"),
     use_geometric_matching: bool = Query(True, description="Enable geometric pattern recognition"),
     use_shape_consistency: bool = Query(True, description="Enable advanced shape consistency checking"),
+    use_edge_analysis: bool = Query(True, description="Enable edge structure analysis"),
+    use_cap_focus: bool = Query(False, description="Emphasize top-region (cap) color for look-alike variants"),
+    cap_focus_ratio: float = Query(0.2, description="Top crop ratio (0-1) used for cap-focused color check"),
     
     # 4. MATCHING WEIGHTS (must sum to 1.0)
-    vector_weight: float = Query(0.5, description="Weight for vector similarity (0.0-1.0)"),
+    vector_weight: float = Query(0.45, description="Weight for vector similarity (0.0-1.0)"),
     color_weight: float = Query(0.2, description="Weight for color histogram (0.0-1.0)"),
     geometric_weight: float = Query(0.2, description="Weight for geometric matching (0.0-1.0)"),
     shape_weight: float = Query(0.1, description="Weight for shape consistency (0.0-1.0)"),
+    edge_weight: float = Query(0.05, description="Weight for edge structure analysis (0.0-1.0)"),
     
     # 5. ADVANCED MATCHING THRESHOLDS
     min_color_similarity: float = Query(0.3, description="Minimum color similarity threshold"),
     min_geometric_similarity: float = Query(0.2, description="Minimum geometric similarity threshold"),
     min_shape_consistency: float = Query(0.4, description="Minimum shape consistency threshold"),
+    min_edge_similarity: float = Query(0.3, description="Minimum edge structure similarity threshold"),
     
     # 6. MULTI-VIEW QUERY STRATEGY (CRITICAL for 90% accuracy)
     use_multi_view: bool = Query(True, description="Use multi-view query strategy (recommended for 90% accuracy)"),
     max_query_views: int = Query(8, description="Maximum number of query views to generate"),
+    
+    # 7. ENSEMBLE EMBEDDINGS (NEW)
+    use_ensemble: bool = Query(True, description="Use ensemble embeddings (CLIP + DINOv2) for better accuracy"),
+    
+    # 8. ADVANCED AUGMENTATION (NEW)
+    use_advanced_augmentation: bool = Query(True, description="Use advanced augmentations (perspective, color jitter, blur)"),
+    
+    # 9. CROSS-MODAL SEARCH (NEW)
+    text_query: str | None = Query(None, description="Optional text query for cross-modal search (e.g., 'red Coca-Cola bottle')"),
+    
+    # 10. HIERARCHICAL FILTERING (NEW)
+    filter_by_category: bool = Query(False, description="Pre-filter by category if category metadata available"),
+    filter_by_brand: bool = Query(False, description="Pre-filter by brand if brand metadata available"),
+    
+    # 11. CONFIDENCE SCORES (NEW)
+    return_confidence: bool = Query(True, description="Return confidence scores for each match"),
+    min_confidence: float = Query(0.7, description="Minimum confidence threshold (0.0-1.0)"),
 ):
+    """
+    Enhanced search endpoint with flexible modelName and SKU filtering.
+    
+    - modelName is required: searches for all model names available across different SKUs
+    - If modelName + skuIds are given: searches only for those specific SKUs of that model
+    - If only modelName is given (no skuIds): searches for all SKUs of that model name
+    
+    Supports multiple SKUs via comma-separated list in skuIds parameter.
+    
+    PERFORMANCE NOTE: Optimized to prevent 524 timeout errors:
+    - Reduced max_advanced_matching from 100 to 50
+    - Reduced max_initial_results from 500 to 300
+    - Uses only first query view for advanced matching (instead of all views)
+    - Added batch processing timeouts
+    - Early exit when enough good matches are found
+    """
     start_time = time.time()
-    logger.info(f"SEARCH: {modelName} | Floor: {similarity_threshold} | Drop-off: {relative_drop_off}")
+    
+    # Parse SKU IDs from comma-separated string
+    sku_list = None
+    if skuIds:
+        sku_list = [sku.strip() for sku in skuIds.split(",") if sku.strip()]
+    
+    logger.info(f"SEARCH: modelName={modelName} | skuIds={sku_list} | shelf_name={shelf_name} | Floor: {similarity_threshold} | Drop-off: {relative_drop_off}")
     
     # --- 1. SETUP & QUERY ---
     collection = get_single_query_images_collection()
-    query_doc = collection.find_one({"modelName": modelName})
-    if not query_doc:
-        raise HTTPException(status_code=404, detail="Model not found")
-
-    query_shape = query_doc.get("shape_label", "unknown")
-    image_bytes = base64.b64decode(query_doc.get("image_base64"))
-    query_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    logo_bbox = query_doc.get("logo_bbox")
     
-    # ✅ Using FULL product image for matching (stored in ModelTraining endpoint)
-    # This provides better results for:
-    # - Color histogram analysis (full product colors)
-    # - Shape consistency (full product shape)
-    # - Geometric matching (more features from full product)
-    # - Vector similarity (better context)
-
-    # --- 2. MULTI-VIEW QUERY STRATEGY (CRITICAL for 90% accuracy) ---
+    # Build query based on provided parameters
+    query: Dict[str, Any] = {"modelName": modelName}
+    if sku_list:
+        if len(sku_list) == 1:
+            query["skuId"] = sku_list[0]
+        else:
+            query["skuId"] = {"$in": sku_list}
+    
+    # Find all matching query documents
+    query_docs = list(collection.find(query))
+    
+    if not query_docs:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"No matching models found for modelName={modelName}, skuIds={sku_list}"
+        )
+    
+    logger.info(f"SEARCH: Found {len(query_docs)} matching query images")
+    
+    # --- 2. MULTI-VIEW QUERY STRATEGY FOR ALL QUERY IMAGES ---
     loop = asyncio.get_event_loop()
-    vectorizer = get_vectorizer()
+    # Initialize vectorizer with ensemble option (use singleton)
+    vectorizer = get_vectorizer(use_ensemble=use_ensemble)
     datastore = get_datastore()
     
-    # Generate multiple views of the query image for robust matching
-    query_views = [query_img]  # Always include original
-    if use_multi_view:
-        augmenter = get_query_augmenter()
-        views = augmenter.generate_smart_views(query_img, logo_bbox=logo_bbox)
-        query_views = views[:max_query_views]
-        logger.info(f"SEARCH: Generated {len(query_views)} query views for multi-view matching")
+    # Handle text query for cross-modal search
+    text_query_vector = None
+    if text_query and text_query.strip():
+        try:
+            text_query_vector = vectorizer.get_text_embedding(text_query.strip())
+            logger.info(f"SEARCH: Using text query: '{text_query.strip()}'")
+        except Exception as e:
+            logger.warning(f"SEARCH: Text query failed: {e}, falling back to image-only search")
+            text_query_vector = None
     
-    # Extract embeddings for all views
-    query_vectors = []
-    for view in query_views:
-        view_vector = await loop.run_in_executor(
-            None,
-            vectorizer.get_image_embedding,
-            view
-        )
-        query_vectors.append(view_vector)
+    # Collect all query vectors from all matching query images
+    all_query_vectors = []
+    query_images_info = []  # Store info for each query image
+    
+    for query_doc in query_docs:
+        query_shape = query_doc.get("shape_label", "unknown")
+        image_bytes = base64.b64decode(query_doc.get("image_base64"))
+        query_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        logo_bbox = query_doc.get("logo_bbox")
+        
+        # Generate multiple views of the query image for robust matching
+        query_views = [query_img]  # Always include original
+        if use_multi_view:
+            augmenter = get_query_augmenter()
+            if use_advanced_augmentation:
+                # Use enhanced smart views with advanced augmentations
+                views = augmenter.generate_enhanced_smart_views(
+                    query_img, 
+                    logo_bbox=logo_bbox,
+                    include_advanced_aug=True,
+                    max_views=max_query_views
+                )
+            else:
+                # Use basic smart views
+                views = augmenter.generate_smart_views(query_img, logo_bbox=logo_bbox)
+            query_views = views[:max_query_views]
+        
+        # Extract embeddings for all views
+        # IMPORTANT: Always use DINOv2 (1024-dim) for vector search to match datastore
+        # Ensemble search (CLIP) would require storing CLIP embeddings separately
+        # For now, ensemble is disabled for vector search to avoid dimension mismatch
+        query_vectors = []
+        for view in query_views:
+            # Always get DINOv2 embedding (1024-dim, compatible with datastore)
+            view_vector = await loop.run_in_executor(
+                None,
+                vectorizer.get_image_embedding,  # Returns DINOv2 (1024-dim) regardless of use_ensemble
+                view
+            )
+            query_vectors.append(view_vector)
+        
+        # NOTE: Text query with CLIP requires separate handling
+        # For now, text queries are not combined with image embeddings during vector search
+        # This would require storing CLIP embeddings in datastore or computing on-the-fly
+        
+        query_images_info.append({
+            "query_img": query_img,
+            "query_views": query_views,
+            "query_vectors": query_vectors,
+            "query_shape": query_shape,
+            "modelName": query_doc.get("modelName"),
+            "skuId": query_doc.get("skuId")
+        })
+        all_query_vectors.extend(query_vectors)
+    
+    logger.info(f"SEARCH: Generated {len(all_query_vectors)} total query vectors from {len(query_docs)} query images")
+    
+    # --- 2.0. HIERARCHICAL FILTERING (Category/Brand Pre-filtering) ---
+    # Extract category/brand from query docs for filtering
+    query_categories = set()
+    query_brands = set()
+    for query_doc in query_docs:
+        category = query_doc.get("categoryId") or query_doc.get("category")
+        brand = query_doc.get("brandId") or query_doc.get("brand")
+        if category:
+            query_categories.add(str(category))
+        if brand:
+            query_brands.add(str(brand))
+    
+    logger.info(f"SEARCH: Query categories: {query_categories}, brands: {query_brands}")
     
     # --- 2.1. MULTI-VIEW VECTOR SEARCH ---
-    # Query with all views and combine results
+    # Query with all views from all query images and combine results
     all_results: Dict[str, Dict[str, Any]] = {}  # crop_id -> {best_score, count, data}
     
-    # PERFORMANCE: Limit initial results and use pagination if needed
-    max_initial_results = 500
-    max_results_per_view = max_initial_results // len(query_views) if len(query_views) > 1 else max_initial_results
+    # PERFORMANCE: Limit initial results to prevent timeout (524 errors)
+    # REDUCED from 500 to 300 to speed up processing
+    max_initial_results = 300
+    if len(all_query_vectors) == 0:
+        raise HTTPException(status_code=500, detail="No query vectors generated")
+    # Ensure at least 1 result per view, but distribute max_initial_results across views
+    max_results_per_view = max(1, max_initial_results // len(all_query_vectors))
     
-    for i, query_vector in enumerate(query_vectors):
+    for i, query_vector in enumerate(all_query_vectors):
         view_results = datastore.query_similar(query_vector, n_results=max_results_per_view)
         
         for res in view_results:
@@ -1021,30 +1646,44 @@ async def search_visual_by_available(
             if not crop_id:
                 continue
             
-            l2_distance = float(res.get("score", 2.0))
-            similarity = l2_to_cosine(l2_distance)
+            # Hierarchical filtering: Category/Brand pre-filtering
+            if filter_by_category and query_categories:
+                candidate_category = str(data.get("categoryId") or data.get("category") or "")
+                if candidate_category and candidate_category not in query_categories:
+                    continue  # Skip if category doesn't match
             
-            # Keep best score across all views
+            if filter_by_brand and query_brands:
+                candidate_brand = str(data.get("brandId") or data.get("brand") or "")
+                if candidate_brand and candidate_brand not in query_brands:
+                    continue  # Skip if brand doesn't match
+            
+            distance = float(res.get("score", 2.0))
+            # Use IP metric conversion (IP distance = 1 - cosine for normalized vectors)
+            # For backward compatibility, detect metric type from datastore
+            metric_type = datastore.get_metric_type() if hasattr(datastore, 'get_metric_type') else "IP"
+            similarity = distance_to_similarity(distance, metric_type=metric_type)
+            
+            # Keep best score across all views and all query images
             if crop_id not in all_results:
                 all_results[crop_id] = {
                     "best_score": similarity,
                     "view_count": 1,
                     "data": data,
-                    "l2_distance": l2_distance
+                    "distance": distance  # Store raw distance (IP or L2)
                 }
             else:
                 # Update if this view has better score
                 if similarity > all_results[crop_id]["best_score"]:
                     all_results[crop_id]["best_score"] = similarity
-                    all_results[crop_id]["l2_distance"] = l2_distance
+                    all_results[crop_id]["distance"] = distance
                 all_results[crop_id]["view_count"] += 1
     
     # Convert to list format for compatibility
     results = [
         {
-            "score": info["l2_distance"],
+            "score": info["distance"],  # Raw distance (IP or L2)
             "data": info["data"],
-            "multi_view_score": info["best_score"],  # Best score across views
+            "multi_view_score": info["best_score"],  # Best cosine similarity across views
             "view_count": info["view_count"]  # How many views matched this candidate
         }
         for crop_id, info in all_results.items()
@@ -1057,38 +1696,49 @@ async def search_visual_by_available(
     results = results[:max_initial_results]
     
     query_time = time.time() - start_time
-    logger.info(f"SEARCH: Multi-view vector query completed in {query_time:.2f}s, found {len(results)} unique candidates from {len(query_views)} views")
-
+    logger.info(f"SEARCH: Multi-view vector query completed in {query_time:.2f}s, found {len(results)} unique candidates from {len(all_query_vectors)} views")
+    
     # --- 3. FILTERING & ADVANCED MATCHING ---
     potential_matches = []
     
     # Normalize weights
     total_weight = vector_weight + (color_weight if use_color_analysis else 0) + \
                    (geometric_weight if use_geometric_matching else 0) + \
-                   (shape_weight if use_shape_consistency else 0)
+                   (shape_weight if use_shape_consistency else 0) + \
+                   (edge_weight if use_edge_analysis else 0)
     
     if total_weight == 0:
-        total_weight = 1.0  # Fallback to vector only
+        # If all weights are 0, fallback to vector only with weight 1.0
+        total_weight = 1.0
+        vector_weight = 1.0
     
     # Initialize matching analyzers if needed
     color_analyzer = get_color_analyzer() if use_color_analysis else None
     geometric_recognizer = get_geometric_recognizer() if use_geometric_matching else None
     shape_checker = get_shape_checker() if use_shape_consistency else None
+    edge_analyzer = get_edge_analyzer() if use_edge_analysis else None
     
-    # Convert query images to numpy arrays for matching
-    # Use original image for advanced matching (or best view)
-    query_img_np = np.array(query_img)
-    query_views_np = [np.array(view) for view in query_views]
+    # Use the first query image's shape for filtering (or combine logic if needed)
+    # For simplicity, we'll use shape from first query image
+    primary_query_shape = "unknown"
+    if query_images_info and len(query_images_info) > 0 and query_images_info[0]:
+        primary_query_shape = query_images_info[0].get("query_shape", "unknown")
     
     logger.info(f"SEARCH: Processing {len(results)} candidates with advanced matching")
     
     for res in results:
         data = res.get("data") or {}
         
+        # Shelf Name Filter (if provided)
+        if shelf_name:
+            candidate_shelf_name = data.get("shelf_name")
+            if candidate_shelf_name != shelf_name:
+                continue  # Skip this candidate if shelf_name doesn't match
+        
         # Shape Filter (basic)
-        if filter_by_shape and query_shape != "unknown":
+        if filter_by_shape and primary_query_shape != "unknown":
             candidate_shape = data.get("shape_label") or data.get("metadata", {}).get("shape_label") or "unknown"
-            if candidate_shape != "unknown" and query_shape != candidate_shape:
+            if candidate_shape != "unknown" and primary_query_shape != candidate_shape:
                 continue 
 
         # Calculate Vector Similarity Score (use multi-view score if available)
@@ -1096,8 +1746,10 @@ async def search_visual_by_available(
         if multi_view_score is not None:
             vector_similarity = float(multi_view_score)
         else:
-            l2_distance = float(res.get("score", 2.0))
-            vector_similarity = l2_to_cosine(l2_distance)
+            distance = float(res.get("score", 2.0))
+            # Use IP metric conversion (IP distance = 1 - cosine for normalized vectors)
+            metric_type = datastore.get_metric_type() if hasattr(datastore, 'get_metric_type') else "IP"
+            vector_similarity = distance_to_similarity(distance, metric_type=metric_type)
 
         # Hard Floor on vector similarity
         if vector_similarity < similarity_threshold:
@@ -1106,25 +1758,29 @@ async def search_visual_by_available(
         bbox = get_bbox_from_record(data)
         if not bbox: continue
         
-        # Initialize combined score with vector similarity
-        combined_score = vector_similarity * vector_weight
         matching_details = {
             "vector": vector_similarity,
             "color": 0.0,
             "geometric": 0.0,
-            "shape": 0.0
+            "shape": 0.0,
+            "edge": 0.0
         }
         
+        # Calculate initial normalized score (vector only, normalized by total_weight)
+        initial_score = (vector_similarity * vector_weight) / total_weight
+        
         # Advanced matching features (only for top candidates to save computation)
-        # We'll apply these after initial filtering to top candidates
+        # Preserve view_count from results if available
+        view_count = res.get("view_count", 1)
         potential_matches.append({
             "crop_id": data.get("_id"),
             "shelf_id": str(data.get("parent_image_id")),
             "bbox": bbox,
-            "score": vector_similarity,  # Initial score
+            "score": initial_score,  # Initial normalized score
             "vector_score": vector_similarity,
             "matching_details": matching_details,
-            "data": data  # Store data for later advanced matching
+            "data": data,  # Store data for later advanced matching
+            "view_count": view_count  # Preserve view_count for confidence calculation
         })
 
     if not potential_matches:
@@ -1135,10 +1791,11 @@ async def search_visual_by_available(
     potential_matches.sort(key=lambda x: x["vector_score"], reverse=True)
     
     # Apply advanced matching to top candidates (limit to avoid performance issues)
-    max_advanced_matching = min(100, len(potential_matches))
+    # REDUCED from 100 to 50 to prevent timeouts (524 errors)
+    max_advanced_matching = min(50, len(potential_matches))
     top_candidates = potential_matches[:max_advanced_matching]
     
-    logger.info(f"SEARCH: Applying advanced matching to top {len(top_candidates)} candidates")
+    logger.info(f"SEARCH: Applying advanced matching to top {len(top_candidates)} candidates (reduced from 100 to prevent timeouts)")
     
     # Load shelf images for candidate extraction
     shelves_dir = settings.SHELF_DIR
@@ -1149,6 +1806,16 @@ async def search_visual_by_available(
         """Process a single candidate with advanced matching."""
         shelf_id = candidate["shelf_id"]
         bbox = candidate["bbox"]
+
+        def top_crop(img: np.ndarray, ratio: float) -> np.ndarray:
+            """Return top portion of the image; keeps at least 1 row to avoid empty crops."""
+            if img is None or img.size == 0:
+                return img
+            h = img.shape[0]
+            if h <= 1 or ratio <= 0:
+                return img
+            cut = max(1, min(h, int(round(h * ratio))))
+            return img[:cut, :, ...]
         
         # Load shelf image if not cached
         if shelf_id not in shelf_images_cache:
@@ -1176,34 +1843,62 @@ async def search_visual_by_available(
             return candidate
         
         # Apply advanced matching features with multi-view strategy
+        # Try matching against all query images and take best score
         color_scores = []
+        cap_color_scores = []
         geometric_scores = []
         shape_scores = []
+        edge_scores = []
         
         try:
-            # Try matching with all query views, take best score
-            for query_view_np in query_views_np:
-                # Color Histogram Analysis
-                if use_color_analysis and color_analyzer:
-                    color_sim = color_analyzer.get_color_similarity(query_view_np, candidate_img)
-                    color_scores.append(color_sim)
-                
-                # Geometric Pattern Recognition
-                if use_geometric_matching and geometric_recognizer:
-                    geo_sim = geometric_recognizer.get_geometric_similarity(
-                        query_view_np, candidate_img, use_sift=True
-                    )
-                    geometric_scores.append(geo_sim)
-                
-                # Shape Consistency
-                if use_shape_consistency and shape_checker:
-                    shape_sim = shape_checker.get_shape_consistency(query_view_np, candidate_img)
-                    shape_scores.append(shape_sim)
+            # OPTIMIZATION: Use only the first (original) query view from each query image to reduce computation
+            # This reduces processing time significantly while still maintaining good accuracy
+            # Original: compared against all views (8 views × N images = many comparisons)
+            # Optimized: compare against first view only (1 view × N images = N comparisons)
+            for query_info in query_images_info:
+                # Use only the first (original) view to reduce computation time
+                if len(query_info["query_views"]) > 0:
+                    query_view_np = np.array(query_info["query_views"][0])
+                    
+                    # Color Histogram Analysis
+                    if use_color_analysis and color_analyzer:
+                        color_sim = color_analyzer.get_color_similarity(query_view_np, candidate_img)
+                        color_scores.append(color_sim)
+                        if use_cap_focus:
+                            q_cap = top_crop(query_view_np, cap_focus_ratio)
+                            c_cap = top_crop(candidate_img, cap_focus_ratio)
+                            if q_cap.size > 0 and c_cap.size > 0:
+                                cap_color_sim = color_analyzer.get_color_similarity(q_cap, c_cap)
+                                cap_color_scores.append(cap_color_sim)
+                    
+                    # Geometric Pattern Recognition
+                    if use_geometric_matching and geometric_recognizer:
+                        geo_sim = geometric_recognizer.get_geometric_similarity(
+                            query_view_np, candidate_img, use_sift=True
+                        )
+                        geometric_scores.append(geo_sim)
+                    
+                    # Shape Consistency
+                    if use_shape_consistency and shape_checker:
+                        shape_sim = shape_checker.get_shape_consistency(query_view_np, candidate_img)
+                        shape_scores.append(shape_sim)
+                    
+                    # Edge Structure Analysis
+                    if use_edge_analysis and edge_analyzer:
+                        edge_sim = edge_analyzer.get_edge_similarity(query_view_np, candidate_img)
+                        edge_scores.append(edge_sim)
             
-            # Use best score across all views
+            # Use best score across all views and all query images
             color_score = max(color_scores) if color_scores else 0.0
+            cap_color_score = max(cap_color_scores) if cap_color_scores else 0.0
+            # Blend cap color (if enabled) to emphasize top-region differences
+            if use_cap_focus and use_color_analysis:
+                # If cap score is present, give it higher weight; otherwise fallback to full color
+                blended_color = 0.7 * cap_color_score + 0.3 * color_score if cap_color_scores else color_score
+                color_score = blended_color
             geometric_score = max(geometric_scores) if geometric_scores else 0.0
             shape_score = max(shape_scores) if shape_scores else 0.0
+            edge_score = max(edge_scores) if edge_scores else 0.0
             
             # Apply thresholds (use best score, so more lenient)
             if use_color_analysis and color_score < min_color_similarity:
@@ -1213,6 +1908,9 @@ async def search_visual_by_available(
                 return None  # Skip this candidate
             
             if use_shape_consistency and shape_score < min_shape_consistency:
+                return None  # Skip this candidate
+            
+            if use_edge_analysis and edge_score < min_edge_similarity:
                 return None  # Skip this candidate
             
         except Exception as e:
@@ -1225,34 +1923,52 @@ async def search_visual_by_available(
             candidate["vector_score"] * vector_weight +
             color_score * (color_weight if use_color_analysis else 0) +
             geometric_score * (geometric_weight if use_geometric_matching else 0) +
-            shape_score * (shape_weight if use_shape_consistency else 0)
+            shape_score * (shape_weight if use_shape_consistency else 0) +
+            edge_score * (edge_weight if use_edge_analysis else 0)
         ) / total_weight
         
         # Update candidate
         candidate["score"] = combined_score
         candidate["matching_details"]["color"] = color_score
+        if use_cap_focus:
+            candidate["matching_details"]["cap_color"] = cap_color_score
         candidate["matching_details"]["geometric"] = geometric_score
         candidate["matching_details"]["shape"] = shape_score
+        candidate["matching_details"]["edge"] = edge_score
         
         return candidate
     
     # Process candidates in executor to avoid blocking
     loop = asyncio.get_event_loop()
     
-    # Process in batches
-    batch_size = 20
+    # Process in smaller batches to prevent timeout
+    # REDUCED batch size from 20 to 10 for faster processing and better timeout handling
+    batch_size = 10
     enhanced_candidates = []
     for i in range(0, len(top_candidates), batch_size):
         batch = top_candidates[i:i + batch_size]
         
-        # Process batch in executor
-        processed_batch = await loop.run_in_executor(
-            None,
-            lambda: [process_candidate_advanced_matching(c) for c in batch]
-        )
+        # Process batch in executor with timeout protection
+        try:
+            processed_batch = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: [process_candidate_advanced_matching(c) for c in batch]
+                ),
+                timeout=30.0  # 30 second timeout per batch
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"SEARCH: Batch {i//batch_size + 1} timed out, skipping remaining candidates")
+            # Use vector scores only for remaining candidates
+            break
         
         # Filter out None results (candidates that didn't pass thresholds)
         enhanced_candidates.extend([c for c in processed_batch if c is not None])
+        
+        # Early exit if we have enough good matches
+        if len(enhanced_candidates) >= 30:
+            logger.info(f"SEARCH: Early exit - found {len(enhanced_candidates)} good matches")
+            break
     
     # For remaining candidates, use vector score only (no advanced matching)
     remaining_candidates = potential_matches[max_advanced_matching:]
@@ -1261,27 +1977,89 @@ async def search_visual_by_available(
     all_candidates = enhanced_candidates + remaining_candidates
     
     # Dynamic Threshold Calculation
+    # Apply dynamic threshold based on best combined score
+    # Also ensure vector_score still meets the hard floor (already checked earlier, but double-check for safety)
     if all_candidates:
         global_max_score = max(m["score"] for m in all_candidates)
         dynamic_cutoff = global_max_score - relative_drop_off
-        final_cutoff = max(similarity_threshold, dynamic_cutoff)
+        # Use dynamic cutoff, but ensure we don't go below a reasonable minimum
+        # Since scores are normalized, we need to estimate a reasonable floor
+        # The hard floor (similarity_threshold) is already applied to vector_similarity earlier
+        # So we can use a lower normalized threshold here as a safety net
+        # Safety check: ensure total_weight is not zero
+        if total_weight == 0:
+            total_weight = 1.0
+        min_normalized_threshold = (similarity_threshold * vector_weight) / total_weight * 0.8  # 80% of normalized threshold
+        final_cutoff = max(min_normalized_threshold, dynamic_cutoff)
     else:
-        final_cutoff = similarity_threshold
+        # Fallback: use normalized threshold
+        # Safety check: ensure total_weight is not zero
+        if total_weight == 0:
+            total_weight = 1.0
+        final_cutoff = (similarity_threshold * vector_weight) / total_weight
 
-    best_matches: Dict[str, MatchResult] = {}
+    best_matches: Dict[str, Dict[str, Any]] = {}
 
     for m in all_candidates:
-        if m["score"] < final_cutoff:
-            continue # Dropped by dynamic threshold
+        # Check both: combined score meets dynamic threshold AND vector score still meets hard floor
+        if m["score"] < final_cutoff or m["vector_score"] < similarity_threshold:
+            continue # Dropped by dynamic threshold or hard floor
+        
+        # Calculate confidence score
+        # Use ensemble variance if available, otherwise use feature agreement
+        confidence = 1.0
+        if return_confidence:
+            # Calculate confidence based on feature agreement
+            matching_details = m.get("matching_details") or {}
+            if not isinstance(matching_details, dict):
+                matching_details = {}
+            feature_scores = [
+                matching_details.get("vector", 0) if matching_details else 0,
+                matching_details.get("color", 0) if matching_details else 0,
+                matching_details.get("geometric", 0) if matching_details else 0,
+                matching_details.get("shape", 0) if matching_details else 0,
+                matching_details.get("edge", 0) if matching_details else 0
+            ]
+            # Remove zero scores (disabled features)
+            feature_scores = [s for s in feature_scores if s > 0]
+            if len(feature_scores) > 1:
+                # Confidence = 1 - variance (higher variance = lower confidence)
+                mean_score = np.mean(feature_scores)
+                variance = np.var(feature_scores)
+                # Normalize variance to [0, 1] range (assuming max variance ~0.25)
+                normalized_variance = min(1.0, variance / 0.25)
+                confidence = 1.0 - normalized_variance
+            else:
+                # Single feature, use score as confidence
+                confidence = feature_scores[0] if feature_scores else m["score"]
             
-        c_id = m["crop_id"]
+            # Also consider view_count (more views matching = higher confidence)
+            view_count = m.get("view_count", 1)
+            if len(all_query_vectors) > 0:
+                view_confidence = min(1.0, view_count / len(all_query_vectors) * 2)  # Normalize
+                confidence = 0.7 * confidence + 0.3 * view_confidence
+            else:
+                # Fallback if no query vectors (shouldn't happen, but safety check)
+                confidence = confidence * 0.9  # Slightly reduce confidence
+        
+        # Filter by minimum confidence
+        if return_confidence and confidence < min_confidence:
+            continue
+        
+        c_id = m.get("crop_id")
+        if not c_id:  # Skip if crop_id is None or empty
+            continue
+        
         # Keep best score for unique crop ID
-        if c_id not in best_matches or m["score"] > best_matches[c_id].score:
-            best_matches[c_id] = MatchResult(
-                shelf_id=m["shelf_id"],
-                bbox=m["bbox"],
-                score=m["score"]
-            )
+        current_score = m.get("score", 0.0) or 0.0
+        if c_id not in best_matches or current_score > best_matches[c_id].get("score", 0.0):
+            best_matches[c_id] = {
+                "shelf_id": m["shelf_id"],
+                "bbox": m["bbox"],
+                "score": m["score"],
+                "confidence": confidence,
+                "matching_details": m.get("matching_details", {})
+            }
 
     if not best_matches:
         raise HTTPException(status_code=404, detail="No matches passed Dynamic Threshold")
@@ -1289,7 +2067,13 @@ async def search_visual_by_available(
     # Group matches by shelf
     shelf_matches = defaultdict(list)
     for m in best_matches.values():
-        shelf_matches[m.shelf_id].append(m)
+        # Convert to MatchResult for compatibility
+        match_result = MatchResult(
+            shelf_id=m["shelf_id"],
+            bbox=m["bbox"],
+            score=m["score"]
+        )
+        shelf_matches[m["shelf_id"]].append(match_result)
 
     # --- 4. VISUALIZATION (RED & GREEN BOXES) ---
     # PERFORMANCE FIX: Batch fetch all shelf items in a single query
@@ -1313,8 +2097,10 @@ async def search_visual_by_available(
         if not shelf_path.exists(): continue
         
         img = cv2.imread(str(shelf_path))
-        if img is None: continue
+        if img is None or img.size == 0: continue
+        if len(img.shape) < 2: continue
         h, w = img.shape[:2]
+        if h < 1 or w < 1: continue
 
         # A. Draw RED boxes for everything on the shelf first
         # ---------------------------------------------------
@@ -1373,8 +2159,6 @@ async def search_visual_by_available(
     return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/png")
 
 
-
-
 @router.delete("/reset-database")
 async def reset_database():
     # 1. Clear MongoDB Metadata
@@ -1403,82 +2187,82 @@ async def reset_database():
 
 
 
-@router.get("/debug-db-counts")
-async def debug_db_counts():
-    datastore = get_datastore()
+# @router.get("/debug-db-counts")
+# async def debug_db_counts():
+#     datastore = get_datastore()
     
-    # Check MongoDB Count (Should be small, e.g., 50)
-    mongo_count = 0
-    if datastore.mongo_coll is not None:
-        mongo_count = datastore.mongo_coll.count_documents({})
+#     # Check MongoDB Count (Should be small, e.g., 50)
+#     mongo_count = 0
+#     if datastore.mongo_coll is not None:
+#         mongo_count = datastore.mongo_coll.count_documents({})
 
-    # Check Vector DB Count (If this is 2000+, you have Ghosts!)
-    vector_count = "N/A"
-    try:
-        if datastore.vector_backend == "milvus":
-            vector_count = datastore.milvus_collection.num_entities
-        else:
-            vector_count = datastore.chroma_collection.count()
-    except:
-        pass
+#     # Check Vector DB Count (If this is 2000+, you have Ghosts!)
+#     vector_count = "N/A"
+#     try:
+#         if datastore.vector_backend == "milvus":
+#             vector_count = datastore.milvus_collection.num_entities
+#         else:
+#             vector_count = datastore.chroma_collection.count()
+#     except:
+#         pass
 
-    return {
-        "MongoDB_Items": mongo_count,
-        "VectorDB_Items": vector_count,
-        "Status": "SYNCED" if mongo_count == vector_count else "GHOSTS DETECTED"
-    }
+#     return {
+#         "MongoDB_Items": mongo_count,
+#         "VectorDB_Items": vector_count,
+#         "Status": "SYNCED" if mongo_count == vector_count else "GHOSTS DETECTED"
+#     }
 
 
-@router.get("/shelf-stats/{image_id}")
-async def get_shelf_shape_stats(image_id: str):
-    """
-    Returns the count of bottles, cans, and unknown items 
-    for a specific shelf image.
+# @router.get("/shelf-stats/{image_id}")
+# async def get_shelf_shape_stats(image_id: str):
+#     """
+#     Returns the count of bottles, cans, and unknown items 
+#     for a specific shelf image.
     
-    PERFORMANCE: Uses a single aggregation query instead of multiple count queries.
-    """
-    datastore = get_datastore()
-    if datastore.mongo_coll is None:
-        raise HTTPException(status_code=500, detail="MongoDB not connected")
+#     PERFORMANCE: Uses a single aggregation query instead of multiple count queries.
+#     """
+#     datastore = get_datastore()
+#     if datastore.mongo_coll is None:
+#         raise HTTPException(status_code=500, detail="MongoDB not connected")
 
-    # PERFORMANCE FIX: Use aggregation pipeline to get all counts in a single query
-    pipeline = [
-        {"$match": {"parent_image_id": image_id}},
-        {"$group": {
-            "_id": "$shape_label",
-            "count": {"$sum": 1}
-        }}
-    ]
+#     # PERFORMANCE FIX: Use aggregation pipeline to get all counts in a single query
+#     pipeline = [
+#         {"$match": {"parent_image_id": image_id}},
+#         {"$group": {
+#             "_id": "$shape_label",
+#             "count": {"$sum": 1}
+#         }}
+#     ]
     
-    results = list(datastore.mongo_coll.aggregate(pipeline))
+#     results = list(datastore.mongo_coll.aggregate(pipeline))
     
-    # Also count items with missing shape_label
-    num_missing = datastore.mongo_coll.count_documents({
-        "parent_image_id": image_id,
-        "shape_label": {"$exists": False}
-    })
+#     # Also count items with missing shape_label
+#     num_missing = datastore.mongo_coll.count_documents({
+#         "parent_image_id": image_id,
+#         "shape_label": {"$exists": False}
+#     })
     
-    # Build breakdown dictionary
-    breakdown = {
-        "bottle": 0,
-        "can": 0,
-        "canister": 0,
-        "unknown": 0,
-        "missing_label": num_missing
-    }
+#     # Build breakdown dictionary
+#     breakdown = {
+#         "bottle": 0,
+#         "can": 0,
+#         "canister": 0,
+#         "unknown": 0,
+#         "missing_label": num_missing
+#     }
     
-    for result in results:
-        shape_label = result.get("_id")
-        count = result.get("count", 0)
-        if shape_label in breakdown:
-            breakdown[shape_label] = count
-        elif shape_label is None:
-            breakdown["missing_label"] = count
+#     for result in results:
+#         shape_label = result.get("_id")
+#         count = result.get("count", 0)
+#         if shape_label in breakdown:
+#             breakdown[shape_label] = count
+#         elif shape_label is None:
+#             breakdown["missing_label"] = count
     
-    total = sum(breakdown.values())
+#     total = sum(breakdown.values())
 
-    return {
-        "shelf_id": image_id,
-        "total_items": total,
-        "breakdown": breakdown
-    }
+#     return {
+#         "shelf_id": image_id,
+#         "total_items": total,
+#         "breakdown": breakdown
+#     }

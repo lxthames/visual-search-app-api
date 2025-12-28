@@ -86,9 +86,13 @@ class DataStore:
         chroma_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.chroma_client = chromadb.PersistentClient(path=str(chroma_path))
+        # ChromaDB uses cosine similarity by default (optimal for normalized embeddings)
         self.vector_collection = self.chroma_client.get_or_create_collection(
-            name="product_vectors"
+            name="product_vectors",
+            metadata={"hnsw:space": "cosine"}  # Use cosine similarity (default, but explicit)
         )
+        # ChromaDB metric type
+        self.metric_type = "COSINE"
 
     def _init_milvus_vector_store(self) -> None:
         """Initialize Milvus-based vector store (creates & loads collection if missing)."""
@@ -151,18 +155,31 @@ class DataStore:
             )
 
         # Ensure index exists (optional but recommended for performance)
+        # ✅ UPGRADED: Using HNSW + Inner Product (IP) for better accuracy with normalized embeddings
+        # HNSW provides better recall than IVF_FLAT
+        # IP metric is optimal for L2-normalized embeddings (DINOv2 outputs normalized vectors)
         if not self.milvus_collection.indexes:
             self.milvus_collection.create_index(
                 field_name="embedding",
                 index_params={
-                    "index_type": "IVF_FLAT",  # adjust to your needs: IVF_SQ8, HNSW, etc.
-                    "metric_type": "L2",
-                    "params": {"nlist": 1024},
+                    "index_type": "HNSW",  # Better accuracy than IVF_FLAT
+                    "metric_type": "IP",   # Inner Product = Cosine Similarity for normalized vectors
+                    "params": {
+                        "M": 16,              # Number of connections (default: 16, higher = better recall, more memory)
+                        "efConstruction": 200  # Build-time search width (default: 200, higher = better index quality)
+                    },
                 },
             )
 
         # CRITICAL: load collection into memory so .search() works
         self.milvus_collection.load()
+        
+        # Store metric type for distance conversion
+        self.metric_type = "IP"  # Default to IP for new collections
+        if self.milvus_collection.indexes and len(self.milvus_collection.indexes) > 0:
+            # Get metric type from existing index
+            index_params = self.milvus_collection.indexes[0].params
+            self.metric_type = index_params.get("metric_type", "IP")
 
     # ---------- Shelf helpers ----------
 
@@ -257,10 +274,12 @@ class DataStore:
         self,
         image_id: str,
         objects: List[Dict[str, Any]],  # List of {crop_id, vector, metadata}
+        shelf_name: str | None = None,  # Optional shelf name for filtering
     ) -> None:
         """
         Batch save multiple objects to database. Much faster than individual saves.
         objects: List of dicts with keys: crop_id, vector, metadata, shape_label
+        shelf_name: Optional name for this shelf to use in search filtering
         """
         if not objects:
             return
@@ -306,6 +325,9 @@ class DataStore:
                 "bbox": obj["metadata"].get("bbox"),
                 "timestamp": datetime.now().isoformat(),
             }
+            # Add shelf_name if provided
+            if shelf_name:
+                record["shelf_name"] = shelf_name
             records.append(record)
 
         # 3. Batch save metadata
@@ -323,7 +345,22 @@ class DataStore:
             # Defensive: ensure collection is loaded (cheap if already loaded)
             self.milvus_collection.load()
 
-            search_params = {"metric_type": "L2", "params": {"nprobe": 32}}
+            # ✅ UPGRADED: Using Inner Product (IP) metric for normalized embeddings
+            # IP distance = 1 - cosine_similarity (for normalized vectors)
+            # Check if collection uses HNSW or IVF index to set appropriate params
+            index_info = self.milvus_collection.indexes
+            if index_info and len(index_info) > 0:
+                index_type = index_info[0].params.get("index_type", "HNSW")
+                if index_type == "HNSW":
+                    # HNSW uses "ef" parameter (search width)
+                    search_params = {"metric_type": "IP", "params": {"ef": 100}}
+                else:
+                    # IVF uses "nprobe" parameter
+                    search_params = {"metric_type": "IP", "params": {"nprobe": 32}}
+            else:
+                # Default to HNSW params if no index info available
+                search_params = {"metric_type": "IP", "params": {"ef": 100}}
+            
             search_results = self.milvus_collection.search(
                 data=[query_vector],
                 anns_field="embedding",
@@ -332,12 +369,14 @@ class DataStore:
                 output_fields=["crop_id"],
             )
 
-            if not search_results or not search_results[0]:
+            if not search_results or len(search_results) == 0 or not search_results[0]:
                 return []
 
             hits = search_results[0]
-            crop_ids = [hit.id for hit in hits]
-            distances = [hit.distance for hit in hits]
+            if not hits:
+                return []
+            crop_ids = [hit.id for hit in hits if hasattr(hit, 'id')]
+            distances = [hit.distance for hit in hits if hasattr(hit, 'distance')]
         else:
             results = self.vector_collection.query(
                 query_embeddings=[query_vector],
@@ -377,6 +416,19 @@ class DataStore:
                     found_objects.append({"score": score, "data": meta_data})
 
         return found_objects
+    
+    def get_metric_type(self) -> str:
+        """
+        Get the metric type used by the vector database.
+        
+        Returns:
+            "IP" for Inner Product, "L2" for Euclidean, or "COSINE" for Cosine
+        """
+        if self.vector_backend == "milvus":
+            return getattr(self, 'metric_type', 'IP')
+        else:
+            # ChromaDB typically uses cosine similarity
+            return "COSINE"
 
 
 # Singleton-style accessor
